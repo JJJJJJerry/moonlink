@@ -161,7 +161,7 @@ impl IcebergTableManager {
         if self.iceberg_table.is_none() {
             let table = utils::get_or_create_iceberg_table(
                 &*self.catalog,
-                &self.config.metadata_accessor_config.get_warehouse_uri(),
+                &self.table_data_base_uri(),
                 &self.config.namespace,
                 &self.config.table_name,
                 self.mooncake_table_metadata.schema.as_ref(),
@@ -170,6 +170,41 @@ impl IcebergTableManager {
             self.iceberg_table = Some(table);
         }
         Ok(())
+    }
+
+    /// Returns the base URI used when constructing the Iceberg table location string
+    /// passed to `CreateTableRequest.location`.
+    ///
+    /// # Why not just call `metadata_accessor_config.get_warehouse_uri()`?
+    ///
+    /// `get_warehouse_uri()` returns different things per catalog variant:
+    /// - File catalog → the filesystem root path (doubles as location base, works fine).
+    /// - REST catalog → the **logical warehouse name** (e.g. `"local"`), NOT a URL.
+    ///
+    /// REST catalog servers (e.g. Lakekeeper) parse `location` as a URL via
+    /// `url::Url::parse()`. A bare name like `"local"` has no scheme, so it parses
+    /// as a relative URL and is rejected with HTTP 400 "Not a valid URL".
+    ///
+    /// # Fix
+    ///
+    /// For REST catalog, derive the table data location from `data_accessor_config`
+    /// (the physical storage backend), which holds the real root path. For local
+    /// filesystem storage we prepend `file://` to produce a valid `file:///path` URI.
+    /// Cloud storage configs (S3 → `s3://`, GCS → `gs://`) already carry a scheme.
+    fn table_data_base_uri(&self) -> String {
+        #[cfg(feature = "catalog-rest")]
+        if matches!(
+            &self.config.metadata_accessor_config,
+            crate::IcebergCatalogConfig::Rest { .. }
+        ) {
+            let root = self.config.data_accessor_config.get_root_path();
+            return if root.contains("://") {
+                root // s3://, gs://, etc. are already valid URLs
+            } else {
+                format!("file://{root}") // /abs/path → file:///abs/path
+            };
+        }
+        self.config.metadata_accessor_config.get_warehouse_uri()
     }
 
     /// Initialize table if it exists.

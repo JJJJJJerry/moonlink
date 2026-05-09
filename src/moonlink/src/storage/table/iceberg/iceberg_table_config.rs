@@ -94,6 +94,22 @@ pub enum IcebergCatalogConfig {
 }
 
 impl IcebergCatalogConfig {
+    /// Returns the warehouse identifier for the catalog.
+    ///
+    /// **Return value semantics differ by variant:**
+    ///
+    /// - `File`  → the root filesystem path (e.g. `/data/pg_mooncake`), which also
+    ///             doubles as the base for constructing table data locations.
+    /// - `Rest`  → the **logical warehouse name** registered in the REST catalog server
+    ///             (e.g. `"local"`). This is NOT a URL and must NOT be used as a base
+    ///             for building Iceberg `CreateTableRequest.location`. Use
+    ///             `data_accessor_config.get_root_path()` (converted to a `file://` URL
+    ///             for local storage) to derive the physical data location instead.
+    /// - `Glue`  → the S3 URI warehouse root (e.g. `s3://bucket/prefix`).
+    ///
+    /// Callers that need a fully-qualified URI for table-location construction should
+    /// use `IcebergTableManager::table_data_base_uri()` rather than calling this method
+    /// directly, because the REST variant returns a bare name that fails URL parsing.
     pub fn get_warehouse_uri(&self) -> String {
         match self {
             IcebergCatalogConfig::File { accessor_config } => accessor_config.get_root_path(),

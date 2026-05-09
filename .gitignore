@@ -3,3 +3,5 @@
 .vscode/
 .devcontainer/certs/
 .shared-nginx/
+.DS_Store
+**/.DS_Store

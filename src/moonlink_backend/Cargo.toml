@@ -5,7 +5,7 @@ edition = { workspace = true }
 license = { workspace = true }
 
 [features]
-default = ["storage-fs"]
+default = ["storage-fs", "catalog-rest"]
 
 bulk-ingestion-test = []
 
@@ -17,6 +17,8 @@ storage-s3 = ["moonlink/storage-s3", "moonlink_metadata_store/storage-s3"]
 storage-gcs = ["moonlink/storage-gcs", "moonlink_metadata_store/storage-gcs"]
 storage-fs = ["moonlink/storage-fs", "moonlink_metadata_store/storage-fs"]
 storage-all = ["storage-s3", "storage-gcs", "storage-fs"]
+
+catalog-rest = ["moonlink/catalog-rest"]
 
 [dependencies]
 apache-avro = { workspace = true }

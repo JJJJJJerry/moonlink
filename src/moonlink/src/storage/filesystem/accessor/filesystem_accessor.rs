@@ -72,10 +72,41 @@ impl FileSystemAccessor {
         create_filesystem_accessor(accessor_config)
     }
 
-    /// Sanitize given path.
-    /// Opendal works on relative path, so attempt to sanitize absolute path to relative one if applicable.
+    /// Sanitize given path before handing it to the opendal operator.
+    ///
+    /// opendal's `services::Fs` builder is configured with `root = self.root_path`
+    /// (a plain POSIX path, no scheme — see `operator_utils::create_opendal_operator_impl`),
+    /// and any path passed to `read_object` / `write_object` / `copy_*` is treated as
+    /// **relative to that root** (or as an absolute POSIX path that gets normalized
+    /// against root). It does NOT understand URI schemes like `file://`.
+    ///
+    /// Two normalization steps are required, in order:
+    ///
+    /// 1. **Strip `file://` scheme.** When the iceberg metadata accessor is a REST
+    ///    catalog (Lakekeeper etc.), `IcebergTableManager::table_data_base_uri()` is
+    ///    forced to return `file:///<abs>` (REST servers parse `location` as a URL and
+    ///    reject bare paths). iceberg-rust's `DefaultLocationGenerator` then produces
+    ///    data file paths of the form `file:///<abs>/<table>/data/<file>.parquet`,
+    ///    which flow through `io_utils::write_record_batch_to_iceberg` into
+    ///    `copy_from_local_to_remote(dst=…)`. If we don't strip `file://` here,
+    ///    the `strip_prefix(&self.root_path)` below fails (root has no scheme), the
+    ///    raw `file:///abs/...` string falls through to opendal as a *relative* path,
+    ///    and parquet data ends up written under `<root>/file:/<abs>/...` — visible
+    ///    on disk as a literal `file:` directory next to the real table dirs.
+    ///    `read_object` is also affected: iceberg manifests reference data files by
+    ///    their `file://` URI, so reads come in here with a scheme too.
+    ///
+    /// 2. **Strip `root_path` prefix.** Some callers already build absolute POSIX
+    ///    paths (e.g. file-catalog metadata writes, local index uploads). opendal
+    ///    normalizes absolute paths against root, but stripping here keeps the
+    ///    operator argument relative and avoids relying on that normalization.
+    ///
+    /// Only `file://` is stripped — `s3://` / `gs://` paths are routed to opendal's
+    /// S3/GCS services whose roots already encode the scheme/bucket, so they pass
+    /// through unchanged.
     fn sanitize_path<'a>(&self, path: &'a str) -> &'a str {
-        path.strip_prefix(&self.root_path).unwrap_or(path)
+        let stripped = path.strip_prefix("file://").unwrap_or(path);
+        stripped.strip_prefix(&self.root_path).unwrap_or(stripped)
     }
 
     /// Get IO operator from the catalog.

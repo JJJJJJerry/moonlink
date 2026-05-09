@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::{Error, Result};
@@ -9,6 +10,38 @@ use moonlink::{
 };
 /// Configuration on table creation.
 use serde::{Deserialize, Serialize};
+
+/// User-facing catalog selector. Lets a user pick between mooncake's built-in
+/// File catalog (the default) and an external Iceberg REST catalog (e.g.
+/// Lakekeeper / Polaris) via the `catalog` field of the table-creation JSON.
+///
+/// Example JSON:
+/// ```json
+/// "catalog": {
+///   "type": "rest",
+///   "uri": "http://localhost:8181/catalog",
+///   "warehouse": "local",
+///   "name": "mooncake",
+///   "props": {}
+/// }
+/// ```
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum CatalogConfig {
+    /// Mooncake's built-in file-based catalog. Equivalent to omitting the
+    /// `catalog` field entirely.
+    File,
+    /// Iceberg REST catalog. Requires the `catalog-rest` feature.
+    #[cfg(feature = "catalog-rest")]
+    Rest {
+        uri: String,
+        warehouse: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        props: HashMap<String, String>,
+    },
+}
 
 /// Mooncake table config.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -93,6 +126,14 @@ pub struct TableConfig {
     #[serde(rename = "wal")]
     #[serde(default)]
     pub wal_config: Option<AccessorConfig>,
+
+    /// Iceberg catalog selector. `None` (or `{"type": "file"}`) keeps the
+    /// historical behaviour of using mooncake's built-in File catalog rooted
+    /// at `iceberg.storage_config`. `{"type": "rest", ...}` routes catalog
+    /// commits to an external Iceberg REST service.
+    #[serde(rename = "catalog")]
+    #[serde(default)]
+    pub catalog_config: Option<CatalogConfig>,
 }
 
 impl TableConfig {
@@ -137,6 +178,26 @@ impl TableConfig {
             )));
         }
 
+        let metadata_accessor_config = match self.catalog_config.as_ref() {
+            #[cfg(feature = "catalog-rest")]
+            Some(CatalogConfig::Rest {
+                uri,
+                warehouse,
+                name,
+                props,
+            }) => moonlink::IcebergCatalogConfig::Rest {
+                rest_catalog_config: moonlink::IcebergRestCatalogConfig {
+                    name: name.clone().unwrap_or_else(|| "mooncake".to_string()),
+                    uri: uri.clone(),
+                    warehouse: warehouse.clone(),
+                    props: props.clone(),
+                },
+            },
+            _ => moonlink::IcebergCatalogConfig::File {
+                accessor_config: self.iceberg_config.clone().unwrap(),
+            },
+        };
+
         let config = MoonlinkTableConfig {
             mooncake_table_config: self
                 .mooncake_config
@@ -145,9 +206,7 @@ impl TableConfig {
                 namespace: vec![mooncake_table_id.database.clone()],
                 table_name: mooncake_table_id.table.clone(),
                 data_accessor_config: self.iceberg_config.clone().unwrap(),
-                metadata_accessor_config: moonlink::IcebergCatalogConfig::File {
-                    accessor_config: self.iceberg_config.clone().unwrap(),
-                },
+                metadata_accessor_config,
             },
             wal_table_config: WalConfig::new(
                 self.wal_config.unwrap(),
@@ -186,6 +245,7 @@ mod tests {
                     atomic_write_dir: None,
                 },
             )),
+            catalog_config: None,
         };
         assert_eq!(actual_table_config, expected_table_config);
     }
@@ -239,6 +299,7 @@ mod tests {
                     atomic_write_dir: None,
                 },
             )),
+            catalog_config: None,
         };
         assert_eq!(expected_table_config, actual_table_config);
     }
@@ -313,6 +374,7 @@ mod tests {
                     write_option: None,
                 },
             )),
+            catalog_config: None,
         };
         assert_eq!(expected_table_config, actual_table_config);
     }
@@ -379,6 +441,7 @@ mod tests {
                     endpoint: None,
                 },
             )),
+            catalog_config: None,
         };
         assert_eq!(expected_table_config, actual_table_config);
     }
@@ -421,7 +484,46 @@ mod tests {
                     atomic_write_dir: None,
                 },
             )),
+            catalog_config: None,
         };
         assert_eq!(expected_table_config, actual_table_config);
+    }
+
+    #[cfg(feature = "catalog-rest")]
+    #[test]
+    fn test_table_config_with_rest_catalog() {
+        let serialized = r#"
+            {
+                "mooncake": {
+                    "append_only": false,
+                    "row_identity": "FullRow"
+                },
+                "catalog": {
+                    "type": "rest",
+                    "uri": "http://localhost:8181/catalog",
+                    "warehouse": "local"
+                }
+            }
+        "#;
+
+        let actual = TableConfig::from_json_or_default(
+            serialized,
+            /*default_table_directory=*/ "/tmp/path",
+        )
+        .unwrap();
+        match actual.catalog_config {
+            Some(CatalogConfig::Rest {
+                ref uri,
+                ref warehouse,
+                ref name,
+                ref props,
+            }) => {
+                assert_eq!(uri, "http://localhost:8181/catalog");
+                assert_eq!(warehouse, "local");
+                assert!(name.is_none());
+                assert!(props.is_empty());
+            }
+            other => panic!("expected Rest catalog config, got {:?}", other),
+        }
     }
 }

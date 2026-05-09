@@ -10,7 +10,7 @@ path = "src/bin/profile_test.rs"
 required-features = ["profile-test"]
 
 [features]
-default = ["storage-fs"]
+default = ["storage-fs", "catalog-rest"]
 storage-all = ["storage-fs", "storage-s3", "storage-gcs"]
 test-utils = []
 

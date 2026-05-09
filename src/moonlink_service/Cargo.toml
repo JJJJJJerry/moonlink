@@ -7,7 +7,7 @@ license = { workspace = true }
 [features]
 profiling = ["console-subscriber"]
 
-default = ["storage-fs"]
+default = ["storage-fs", "catalog-rest"]
 rest_api_demo = []
 standalone-test = []
 otel-integration = []
@@ -19,6 +19,8 @@ stress-test = []
 storage-s3 = ["moonlink/storage-s3"]
 storage-gcs = ["moonlink/storage-gcs"]
 storage-fs = ["moonlink/storage-fs"]
+
+catalog-rest = ["moonlink/catalog-rest", "moonlink_backend/catalog-rest"]
 
 [dependencies]
 anyhow = { workspace = true }

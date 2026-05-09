@@ -344,7 +344,18 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
 
     // Append puffin blobs into existing manifest entries.
     deletion_vector_manifest_manager.add_new_puffin_blobs(deletion_vector_blobs_to_add)?;
-    file_index_manifest_manager.add_new_puffin_blobs(file_index_blobs_to_add)?;
+    // SPIKE 0 (2026-05-09): env-gate hash-index 越界注册 to validate cross-engine read hypothesis.
+    // When MOONCAKE_SKIP_HASH_INDEX_MANIFEST=1, hash index puffin won't be registered as
+    // Data+Puffin manifest entry — testing whether removing this越界 unblocks Spark/pyiceberg.
+    // To revert: remove this if-block, keep the unconditional call.
+    if std::env::var("MOONCAKE_SKIP_HASH_INDEX_MANIFEST").is_err() {
+        file_index_manifest_manager.add_new_puffin_blobs(file_index_blobs_to_add)?;
+    } else {
+        eprintln!(
+            "[SPIKE 0] MOONCAKE_SKIP_HASH_INDEX_MANIFEST=1 — skipping hash index manifest registration ({} blobs)",
+            file_index_blobs_to_add.len()
+        );
+    }
 
     // Attempt to finalize all existing manifest entries.
     if let Some(manifest_file) = data_file_manifest_manager.finalize().await? {
