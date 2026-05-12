@@ -8,6 +8,21 @@ use crate::storage::storage_utils::MooncakeDataFileRef;
 
 use std::collections::HashSet;
 
+// DM(Jerry): Normalize the `file://` scheme on both sides before prefix-matching a persisted file
+// path against the warehouse URI. Callers commonly pass `warehouse_uri` without the scheme (e.g.
+// local file-catalog tests) while iceberg manifests / REST-catalog flushes emit paths with the
+// `file://` prefix, so a raw `starts_with` would spuriously reject legitimate remote paths. We only
+// strip `file://`; `s3://` / `gs://` are left intact because their scheme is symmetric on both
+// sides and prefix-matching already works.
+#[cfg(any(test, debug_assertions))]
+fn path_matches_warehouse(path: &str, warehouse_uri: &str) -> bool {
+    let p = path.strip_prefix("file://").unwrap_or(path);
+    let w = warehouse_uri
+        .strip_prefix("file://")
+        .unwrap_or(warehouse_uri);
+    p.starts_with(w)
+}
+
 /// Record persisted records, used to sync to mooncake snapshot.
 #[derive(Debug, Default)]
 pub(crate) struct PersistedRecords {
@@ -88,10 +103,11 @@ impl PersistedRecords {
     #[cfg(any(test, debug_assertions))]
     fn validate_file_indices_remote(&self, file_index: &FileIndex, warehouse_uri: &str) {
         for cur_index_block in file_index.index_blocks.iter() {
-            assert!(cur_index_block
-                .index_file
-                .file_path()
-                .starts_with(warehouse_uri));
+            let p = cur_index_block.index_file.file_path();
+            assert!(
+                path_matches_warehouse(p, warehouse_uri),
+                "index file {p} not under warehouse {warehouse_uri}"
+            );
         }
     }
 
@@ -103,7 +119,11 @@ impl PersistedRecords {
 
             // Validate persisted data files point to remote.
             for cur_data_file in import_result.new_data_files.iter() {
-                assert!(cur_data_file.file_path().starts_with(_warehouse_uri));
+                let p = cur_data_file.file_path();
+                assert!(
+                    path_matches_warehouse(p, _warehouse_uri),
+                    "imported data file {p} not under warehouse {_warehouse_uri}"
+                );
             }
 
             // Validate persisted file indices and index blocks point to remote.
@@ -126,7 +146,11 @@ impl PersistedRecords {
 
             // Validate persisted data files point to remote.
             for cur_data_file in data_compaction_results.new_data_files_imported.iter() {
-                assert!(cur_data_file.file_path().starts_with(_warehouse_uri));
+                let p = cur_data_file.file_path();
+                assert!(
+                    path_matches_warehouse(p, _warehouse_uri),
+                    "compacted data file {p} not under warehouse {_warehouse_uri}"
+                );
             }
 
             // Validate persisted file indices and index blocks point to remote.

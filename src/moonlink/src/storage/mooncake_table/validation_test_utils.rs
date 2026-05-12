@@ -12,12 +12,12 @@ use crate::storage::storage_utils::RawDeletionRecord;
 use crate::storage::storage_utils::RecordLocation;
 /// This module contains testing utils for validation.
 use crate::storage::table::iceberg::deletion_vector::DeletionVector;
+use crate::storage::table::iceberg::io_utils::create_fs_file_io;
 use crate::storage::table::iceberg::puffin_utils;
 use crate::IcebergTableConfig;
 use crate::IcebergTableManager;
 use crate::ObjectStorageCache;
 use crate::TableManager;
-use iceberg::io::FileIOBuilder;
 use moonlink_table_metadata::PositionDelete;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -33,7 +33,7 @@ pub(crate) async fn check_deletion_vector_consistency(disk_file_entry: &DiskFile
         return;
     }
 
-    let local_fileio = FileIOBuilder::new_fs_io().build().unwrap();
+    let local_fileio = create_fs_file_io();
     let blob = puffin_utils::load_blob_from_puffin_file(
         local_fileio,
         disk_file_entry

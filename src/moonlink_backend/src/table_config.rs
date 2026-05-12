@@ -134,6 +134,11 @@ pub struct TableConfig {
     #[serde(rename = "catalog")]
     #[serde(default)]
     pub catalog_config: Option<CatalogConfig>,
+
+    // TODO(jerry): add an explicit Iceberg format-version option here, then plumb it through
+    // MoonlinkTableConfig into iceberg table creation. Do not rely on iceberg-rust defaults:
+    // TableCreation currently defaults to V2, while the validation matrix needs an explicit V3
+    // create path for Lakekeeper/Spark/pyiceberg coverage.
 }
 
 impl TableConfig {

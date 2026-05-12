@@ -91,6 +91,7 @@ impl TestGuard {
                     atomic_write_dir: None,
                 },
             )),
+            catalog_config: None,
         };
         serde_json::to_string(&table_config).unwrap()
     }
@@ -338,12 +339,13 @@ pub async fn crash_and_recover_backend(
 pub async fn ids_from_state_with_deletes(read_state: &ReadState) -> HashSet<i64> {
     use iceberg::io::FileIOBuilder;
     use iceberg::puffin::PuffinReader;
+    use iceberg_storage_opendal::OpenDalStorageFactory;
 
     let (data_files, puffin_files, deletion_vectors, mut position_deletes) =
         decode_read_state_for_testing(read_state);
 
     // Load deletion vector blobs and convert to position deletes
-    let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+    let file_io = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::Fs)).build();
     for cur_blob in deletion_vectors.iter() {
         let puffin_file_path = puffin_files
             .get(cur_blob.puffin_file_number as usize)
@@ -461,6 +463,7 @@ pub fn get_serialized_table_config(tmp_dir: &TempDir) -> String {
                 atomic_write_dir: None,
             },
         )),
+        catalog_config: None,
     };
     serde_json::to_string(&table_config).unwrap()
 }

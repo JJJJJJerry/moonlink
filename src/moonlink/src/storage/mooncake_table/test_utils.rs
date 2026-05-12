@@ -6,6 +6,7 @@ use crate::storage::mooncake_table::table_creation_test_utils::*;
 use crate::storage::mooncake_table::table_operation_test_utils::*;
 use crate::storage::table::iceberg::deletion_vector::DeletionVector as IcebergDeletionVector;
 use crate::storage::table::iceberg::iceberg_table_config::IcebergTableConfig;
+use crate::storage::table::iceberg::io_utils::create_fs_file_io;
 use crate::storage::table::iceberg::puffin_utils;
 use crate::storage::wal::test_utils::WAL_TEST_TABLE_ID;
 use crate::storage::wal::WalManager;
@@ -13,7 +14,6 @@ use crate::{StorageConfig, WalConfig};
 use arrow::array::Int32Array;
 use arrow_array::Array;
 use futures::future::join_all;
-use iceberg::io::FileIOBuilder;
 use moonlink_table_metadata::{DeletionVector, PositionDelete};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::collections::HashSet;
@@ -235,7 +235,7 @@ pub async fn verify_files_and_deletions(
     expected_ids: &[i32],
 ) {
     // Read deletion vector blobs and add to position deletes.
-    let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+    let file_io = create_fs_file_io();
     let mut position_deletes = position_deletes;
     let mut load_blob_futures = Vec::with_capacity(deletion_vectors.len());
     for cur_blob in deletion_vectors.iter() {
