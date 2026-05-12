@@ -7,10 +7,15 @@ use crate::storage::storage_utils::{create_data_file, FileId, TableId, TableUniq
 use crate::storage::table::iceberg::deletion_vector::DeletionVector;
 use crate::storage::table::iceberg::iceberg_table_manager::*;
 use crate::storage::table::iceberg::index::FileIndexBlob;
+use crate::storage::table::iceberg::private_manifest::{
+    validate_deployment, DeploymentStatus, PrivateManifestStore, MOONCAKE_CONTROLLED_BETA_SIGNOFF,
+};
+use crate::storage::table::iceberg::puffin_utils;
 use crate::storage::table::iceberg::puffin_utils::PuffinBlobRef;
 #[cfg(any(test, debug_assertions))]
 use crate::storage::table::iceberg::schema_utils;
 use crate::storage::table::iceberg::snapshot_utils;
+use crate::storage::table::iceberg::table_property::MOONCAKE_PRIVATE_INDEX_ROOT;
 use crate::storage::table::iceberg::utils;
 use crate::storage::table::iceberg::validation as IcebergValidation;
 use crate::Result;
@@ -69,6 +74,128 @@ impl IcebergTableManager {
         );
 
         Ok(Some(mooncake_file_index))
+    }
+
+    /// Verify the per-table private-root deployment shape on load.
+    ///
+    /// Run once per recovery / table-open. Reads the `mooncake.private_index_root`
+    /// + `mooncake.controlled_beta_signoff` Iceberg properties (when the table was
+    /// created with private-root binding), classifies the deployment, logs the
+    /// outcome, and fails recovery when the table sits inside the Iceberg root
+    /// without a signoff (Path c).
+    fn validate_private_root_deployment(&self) -> Result<()> {
+        let iceberg_table = self.iceberg_table.as_ref().unwrap();
+        let metadata = iceberg_table.metadata();
+        let Some(private_root) = metadata.properties().get(MOONCAKE_PRIVATE_INDEX_ROOT) else {
+            return Ok(());
+        };
+        let iceberg_root = iceberg_table.identifier().to_string();
+        let signoff = metadata
+            .properties()
+            .get(MOONCAKE_CONTROLLED_BETA_SIGNOFF)
+            .map(String::as_str);
+        // Use the Iceberg table location (metadata.location) for prefix comparison —
+        // that's the physical root that downstream Iceberg cleanup tools (RemoveOrphanFiles
+        // etc.) operate on.
+        let physical_root = metadata.location();
+        match validate_deployment(physical_root, private_root, signoff) {
+            Ok(DeploymentStatus::Compliant) => {
+                tracing::info!(
+                    iceberg_root = %physical_root,
+                    private_root = %private_root,
+                    iceberg_table = %iceberg_root,
+                    "mooncake private root validated (Compliant)"
+                );
+                Ok(())
+            }
+            Ok(DeploymentStatus::SignedOff { signoff_id }) => {
+                tracing::warn!(
+                    iceberg_root = %physical_root,
+                    private_root = %private_root,
+                    iceberg_table = %iceberg_root,
+                    signoff_id = %signoff_id,
+                    "mooncake private root sits inside Iceberg table root; relying on storage-level guards (controlled-beta signoff present)"
+                );
+                Ok(())
+            }
+            Err(e) => Err(crate::Error::IcebergError(
+                moonlink_error::ErrorStruct::new(
+                    format!("mooncake private root deployment rejected: {e}"),
+                    moonlink_error::ErrorStatus::Permanent,
+                ),
+            )),
+        }
+    }
+
+    /// Rebuild hash file indices from the mooncake-private manifest (Mode 2a).
+    ///
+    /// Returns an empty vec when the table has no private root configured (legacy) or
+    /// when no manifest exists for the current Iceberg snapshot (freshly-restored
+    /// private root, expired snapshot, or a snapshot that produced no hash blobs).
+    /// In the latter case the caller may treat the index as `Degraded` and trigger
+    /// an async rebuild from data files (cost-gating fallback in the meantime).
+    async fn load_file_indices_from_private_manifest(
+        &mut self,
+        file_io: &FileIO,
+        next_file_id: &mut u64,
+    ) -> IcebergResult<Vec<MooncakeFileIndex>> {
+        let Some(private_root) = self.config.private_index_root.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let metadata = self.iceberg_table.as_ref().unwrap().metadata();
+        let Some(snapshot) = metadata.current_snapshot() else {
+            return Ok(Vec::new());
+        };
+        let table_uuid = metadata.uuid();
+        let store = PrivateManifestStore::new(
+            self.filesystem_accessor.clone(),
+            private_root.to_string(),
+            table_uuid,
+        );
+        // Surface the IO error as an iceberg error so the caller's error path stays uniform.
+        let manifest = store
+            .read_snap_manifest(snapshot.snapshot_id())
+            .await
+            .map_err(|e| {
+                IcebergError::new(
+                    iceberg::ErrorKind::Unexpected,
+                    format!(
+                        "read private manifest for snapshot {}",
+                        snapshot.snapshot_id()
+                    ),
+                )
+                .with_source(e)
+            })?;
+        let Some(manifest) = manifest else {
+            return Ok(Vec::new());
+        };
+
+        let table_id = TableId(self.mooncake_table_metadata.table_id);
+        let mut out = Vec::with_capacity(manifest.hash_index_entries.len());
+        for entry in manifest.hash_index_entries.iter() {
+            // PrivateManifestStore stores one blob per puffin file (the same invariant
+            // load_blob_from_puffin_file enforces); offset/size are kept for future
+            // multi-blob layouts and as a cross-check, not used for byte-range loads
+            // until the puffin reader supports it.
+            let blob =
+                puffin_utils::load_blob_from_puffin_file(file_io.clone(), &entry.puffin_file_path)
+                    .await?;
+            let file_index_blob = FileIndexBlob::from_blob(blob)?;
+            let mut iceberg_file_index = file_index_blob.file_index;
+            let mooncake_file_index = iceberg_file_index
+                .as_mooncake_file_index(
+                    &self.remote_data_file_to_file_id,
+                    self.object_storage_cache.clone(),
+                    self.filesystem_accessor.as_ref(),
+                    table_id,
+                    next_file_id,
+                )
+                .await?;
+            self.persisted_file_indices
+                .insert(mooncake_file_index.clone(), entry.puffin_file_path.clone());
+            out.push(mooncake_file_index);
+        }
+        Ok(out)
     }
 
     /// Load data file into table manager from the current manifest entry.
@@ -241,6 +368,7 @@ impl IcebergTableManager {
 
         // Perform validation before load operation.
         self.validate_schema_consistency_at_load();
+        self.validate_private_root_deployment()?;
 
         // Load moonlink related metadata.
         let table_metadata = self.iceberg_table.as_ref().unwrap().metadata();
@@ -331,6 +459,14 @@ impl IcebergTableManager {
                 }
             }
         }
+
+        // Rehydrate hash file indices from the mooncake-private manifest. Legacy
+        // tables (pre-Mode 2a) still get their hash entries via the manifest_list
+        // pass above; both are merged into `loaded_file_indices`.
+        let private_indices = self
+            .load_file_indices_from_private_manifest(&file_io, &mut next_file_id)
+            .await?;
+        loaded_file_indices.extend(private_indices);
 
         let mooncake_snapshot = self.transform_to_mooncake_snapshot(
             loaded_deletion_vector,
