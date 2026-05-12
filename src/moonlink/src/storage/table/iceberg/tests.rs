@@ -44,6 +44,7 @@ use crate::storage::table::iceberg::file_catalog::METADATA_DIRECTORY;
 use crate::storage::table::iceberg::file_catalog::VERSION_HINT_FILENAME;
 use crate::storage::table::iceberg::iceberg_table_config::IcebergTableConfig;
 use crate::storage::table::iceberg::iceberg_table_manager::IcebergTableManager;
+use crate::storage::table::iceberg::manifest_utils::{self, ManifestEntryType};
 use crate::storage::table::iceberg::schema_utils::*;
 use crate::storage::table::iceberg::test_utils::*;
 use crate::storage::wal::test_utils::WAL_TEST_TABLE_ID;
@@ -220,6 +221,35 @@ fn get_file_indices_filepath_and_data_filepaths(
     }
 
     (data_files, index_files)
+}
+
+async fn assert_current_manifest_list_has_no_file_index_entries(
+    iceberg_table_manager: &IcebergTableManager,
+) {
+    let iceberg_table = iceberg_table_manager.iceberg_table.as_ref().unwrap();
+    let table_metadata = iceberg_table.metadata();
+    let current_snapshot = table_metadata.current_snapshot().unwrap();
+    let manifest_list = current_snapshot
+        .load_manifest_list(iceberg_table.file_io(), table_metadata)
+        .await
+        .unwrap();
+
+    for manifest_file in manifest_list.entries() {
+        let manifest = manifest_file
+            .load_manifest(iceberg_table.file_io())
+            .await
+            .unwrap();
+        let (manifest_entries, manifest_metadata) = manifest.into_parts();
+        assert!(!manifest_entries.is_empty());
+        let entry_type =
+            manifest_utils::get_manifest_entry_type(&manifest_entries, &manifest_metadata);
+        assert_ne!(
+            entry_type,
+            ManifestEntryType::FileIndex,
+            "hash index puffin entries must stay out of the Iceberg manifest_list; \
+             Spark/pyiceberg treat Data+Puffin as an invalid data-file entry"
+        );
+    }
 }
 
 /// ================================
@@ -1152,7 +1182,17 @@ async fn test_recover_from_failed_snapshot() {
 /// ================================
 ///
 /// Testing scenario: create iceberg snapshot for index merge.
-async fn test_index_merge_and_create_snapshot_impl(iceberg_table_config: IcebergTableConfig) {
+async fn test_index_merge_and_create_snapshot_impl(mut iceberg_table_config: IcebergTableConfig) {
+    if iceberg_table_config.private_index_root.is_none() {
+        iceberg_table_config.private_index_root = Some(format!(
+            "{}/_mooncake_private",
+            iceberg_table_config
+                .metadata_accessor_config
+                .get_warehouse_uri()
+                .trim_end_matches('/')
+        ));
+    }
+
     // Local filesystem to store write-through cache.
     let table_temp_dir = tempdir().unwrap();
     let file_index_config = FileIndexMergeConfig {
@@ -1280,6 +1320,82 @@ async fn test_index_merge_and_create_snapshot() {
 
     // Common testing logic.
     test_index_merge_and_create_snapshot_impl(iceberg_table_config).await;
+}
+
+#[tokio::test]
+async fn test_hash_index_private_manifest_is_cross_engine_safe() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let private_index_root = format!(
+        "{}/_mooncake_private",
+        iceberg_temp_dir.path().to_str().unwrap()
+    );
+    let mut iceberg_table_config = get_iceberg_table_config(&iceberg_temp_dir);
+    iceberg_table_config.private_index_root = Some(private_index_root);
+
+    // Local filesystem to store write-through cache.
+    let table_temp_dir = tempdir().unwrap();
+    let file_index_config = FileIndexMergeConfig {
+        min_file_indices_to_merge: 2,
+        max_file_indices_to_merge: 2,
+        index_block_final_size: u64::MAX,
+    };
+    let mut config = MooncakeTableConfig::new(table_temp_dir.path().to_str().unwrap().to_string());
+    config.file_index_config = file_index_config;
+    let mooncake_table_metadata = create_test_table_metadata_with_config(
+        table_temp_dir.path().to_str().unwrap().to_string(),
+        config,
+    );
+
+    let cache_temp_dir = tempdir().unwrap();
+    let (mut table, mut notify_rx) = create_mooncake_table_and_notify(
+        mooncake_table_metadata.clone(),
+        iceberg_table_config.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+    )
+    .await;
+    let filesystem_accessor = create_test_filesystem_accessor(&iceberg_table_config);
+
+    for (lsn, row) in [(1, test_row_1()), (2, test_row_2()), (3, test_row_3())] {
+        table.append(row).unwrap();
+        table.commit(lsn);
+        flush_table_and_sync(&mut table, &mut notify_rx, lsn)
+            .await
+            .unwrap();
+    }
+
+    create_mooncake_and_iceberg_snapshot_for_index_merge_for_test(&mut table, &mut notify_rx).await;
+
+    let mut iceberg_table_manager_for_recovery = IcebergTableManager::new(
+        mooncake_table_metadata.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+        filesystem_accessor.clone(),
+        iceberg_table_config.clone(),
+    )
+    .await
+    .unwrap();
+    let (_, snapshot) = iceberg_table_manager_for_recovery
+        .load_snapshot_from_table()
+        .await
+        .unwrap();
+
+    // Cross-engine readers only see Iceberg metadata. Hash-index Puffin blobs used
+    // to appear as Data+Puffin manifest entries, which Spark/pyiceberg reject.
+    assert_current_manifest_list_has_no_file_index_entries(&iceberg_table_manager_for_recovery)
+        .await;
+
+    // Mooncake still recovers the hash index through the private manifest, proving
+    // B-1's compatibility fix did not silently drop the index for mooncake itself.
+    assert_eq!(snapshot.disk_files.len(), 3);
+    assert_eq!(snapshot.indices.file_indices.len(), 2);
+    assert_eq!(snapshot.flush_lsn.unwrap(), 3);
+    validate_recovered_snapshot(
+        &snapshot,
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
+        filesystem_accessor.as_ref(),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

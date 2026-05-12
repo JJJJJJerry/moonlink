@@ -857,7 +857,7 @@ impl IcebergTableManager {
     ///
     /// No-op when:
     /// - `private_index_root` is unconfigured (legacy / non-Mode-2a tables), or
-    /// - no file-index blobs were produced this commit.
+    /// - no file-index blobs were produced and the previous manifest is still valid.
     ///
     /// Uses `self.filesystem_accessor` for I/O, which implies the private root must
     /// live on the same backend / credentials as the data root for now. Cross-bucket
@@ -869,20 +869,35 @@ impl IcebergTableManager {
         let Some(private_root) = self.config.private_index_root.as_deref() else {
             return Ok(());
         };
-        if file_index_blobs.is_empty() {
-            return Ok(());
-        }
 
         let metadata = self.iceberg_table.as_ref().unwrap().metadata();
-        let snapshot_id = match metadata.current_snapshot() {
-            Some(snap) => snap.snapshot_id(),
+        let current_snapshot = match metadata.current_snapshot() {
+            Some(snap) => snap,
             // No snapshot means there's nothing to anchor against — skip; the next
             // non-empty commit will write a manifest covering the same blobs.
             None => return Ok(()),
         };
+        let snapshot_id = current_snapshot.snapshot_id();
         let table_uuid = metadata.uuid();
+        let store = PrivateManifestStore::new(
+            self.filesystem_accessor.clone(),
+            private_root.to_string(),
+            table_uuid,
+        );
+        let live_puffin_files: HashSet<&String> = self.persisted_file_indices.values().collect();
 
         let mut entries: Vec<HashIndexEntry> = Vec::new();
+        if let Some(parent_snapshot_id) = current_snapshot.parent_snapshot_id() {
+            if let Some(parent_manifest) = store.read_snap_manifest(parent_snapshot_id).await? {
+                entries.extend(
+                    parent_manifest
+                        .hash_index_entries
+                        .into_iter()
+                        .filter(|entry| live_puffin_files.contains(&entry.puffin_file_path)),
+                );
+            }
+        }
+
         for (puffin_file_path, blobs) in file_index_blobs.into_iter() {
             for blob in blobs.iter() {
                 let cardinality = blob
@@ -900,11 +915,6 @@ impl IcebergTableManager {
             }
         }
 
-        let store = PrivateManifestStore::new(
-            self.filesystem_accessor.clone(),
-            private_root.to_string(),
-            table_uuid,
-        );
         let manifest = PrivateManifest::new(snapshot_id, table_uuid, entries);
         store.write_snap_manifest(&manifest).await?;
         Ok(())
