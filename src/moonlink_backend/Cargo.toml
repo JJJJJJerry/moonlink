@@ -45,6 +45,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 iceberg = { workspace = true }
+iceberg-storage-opendal = { workspace = true, features = ["opendal-fs"] }
 roaring = { workspace = true }
 rstest = { workspace = true }
 serial_test = { workspace = true }

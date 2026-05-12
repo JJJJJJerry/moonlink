@@ -14,10 +14,10 @@ default = ["storage-fs", "catalog-rest"]
 storage-all = ["storage-fs", "storage-s3", "storage-gcs"]
 test-utils = []
 
-storage-fs = ["opendal/services-fs", "iceberg/storage-fs"]
+storage-fs = ["opendal/services-fs", "iceberg-storage-opendal/opendal-fs"]
 storage-s3 = [
     "opendal/services-s3",
-    "iceberg/storage-s3",
+    "iceberg-storage-opendal/opendal-s3",
     "base64",
     "hmac",
     "sha1",
@@ -27,8 +27,8 @@ storage-s3 = [
 storage-gcs = [
     "opendal/services-gcs",
     "opendal/services-s3",
-    "iceberg/storage-gcs",
-    "iceberg/storage-s3",
+    "iceberg-storage-opendal/opendal-gcs",
+    "iceberg-storage-opendal/opendal-s3",
     "base64",
     "hmac",
     "sha1",
@@ -66,6 +66,7 @@ hmac = { version = "0.12", optional = true }
 iceberg = { workspace = true }
 iceberg-catalog-glue = { workspace = true, optional = true }
 iceberg-catalog-rest = { workspace = true, optional = true }
+iceberg-storage-opendal = { workspace = true, optional = true }
 itertools = { workspace = true }
 lru = { workspace = true }
 memmap2 = "0.9"
