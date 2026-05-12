@@ -3,9 +3,11 @@ use crate::storage::filesystem::accessor_config::AccessorConfig;
 use crate::storage::filesystem::storage_config::StorageConfig;
 use crate::storage::table::iceberg::parquet_utils;
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
-use iceberg::io::{FileIO, FileIOBuilder};
+use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::spec::DataFile;
 use iceberg::spec::TableMetadata as IcebergTableMetadata;
 use iceberg::table::Table as IcebergTable;
@@ -13,6 +15,7 @@ use iceberg::writer::file_writer::location_generator::{
     DefaultLocationGenerator, LocationGenerator,
 };
 use iceberg::{Error as IcebergError, Result as IcebergResult};
+use iceberg_storage_opendal::OpenDalStorageFactory;
 
 /// Get a unique filepath for iceberg table data filepath.
 fn generate_unique_data_filepath(
@@ -99,9 +102,26 @@ pub(crate) async fn upload_index_file(
 
 /// Create iceberg [`FileIO`].
 pub(crate) fn create_file_io(accessor_config: &AccessorConfig) -> IcebergResult<FileIO> {
-    match &accessor_config.storage_config {
+    let (factory, props) = create_storage_factory_and_props(accessor_config)?;
+    Ok(FileIOBuilder::new(factory).with_props(props).build())
+}
+
+/// Build the iceberg storage factory and the matching `FileIO` props in one pass.
+///
+/// DM(Jerry): factory + props were previously two `fn`s that independently `match`ed the same
+/// `storage_config`. Merging removes the foot-gun where adding a backend on one side without the
+/// other would yield a runtime mismatch (factory says S3 / props say Azure → cryptic auth
+/// failures at first IO). Adding a new backend now touches a single arm.
+pub(crate) fn create_storage_factory_and_props(
+    accessor_config: &AccessorConfig,
+) -> IcebergResult<(Arc<dyn StorageFactory>, HashMap<String, String>)> {
+    // DM(Jerry): `mut` is only used when storage-gcs / storage-s3 features are enabled;
+    // under bare `storage-fs` the empty match leaves it untouched.
+    #[allow(unused_mut)]
+    let mut props: HashMap<String, String> = HashMap::new();
+    let factory: Arc<dyn StorageFactory> = match &accessor_config.storage_config {
         #[cfg(feature = "storage-fs")]
-        StorageConfig::FileSystem { .. } => FileIOBuilder::new_fs_io().build(),
+        StorageConfig::FileSystem { .. } => Arc::new(OpenDalStorageFactory::Fs),
         #[cfg(feature = "storage-gcs")]
         StorageConfig::Gcs {
             project,
@@ -112,27 +132,60 @@ pub(crate) fn create_file_io(accessor_config: &AccessorConfig) -> IcebergResult<
             secret_access_key,
             ..
         } => {
-            // Testing environment.
             if *disable_auth {
-                let file_io_builder = FileIOBuilder::new("GCS")
-                    .with_prop(iceberg::io::GCS_PROJECT_ID, project)
-                    .with_prop(iceberg::io::GCS_SERVICE_PATH, endpoint.as_ref().unwrap())
-                    .with_prop(iceberg::io::GCS_NO_AUTH, "true")
-                    .with_prop(iceberg::io::GCS_ALLOW_ANONYMOUS, "true")
-                    .with_prop(iceberg::io::GCS_DISABLE_CONFIG_LOAD, "true")
-                    .with_prop(iceberg::io::GCS_DISABLE_VM_METADATA, "true");
-                return file_io_builder.build();
+                let endpoint = endpoint.as_ref().ok_or_else(|| {
+                    IcebergError::new(
+                        iceberg::ErrorKind::DataInvalid,
+                        "GCS no-auth FileIO requires an endpoint",
+                    )
+                })?;
+                props.insert(iceberg::io::GCS_PROJECT_ID.to_string(), project.clone());
+                props.insert(iceberg::io::GCS_SERVICE_PATH.to_string(), endpoint.clone());
+                props.insert(iceberg::io::GCS_NO_AUTH.to_string(), "true".to_string());
+                props.insert(
+                    iceberg::io::GCS_ALLOW_ANONYMOUS.to_string(),
+                    "true".to_string(),
+                );
+                props.insert(
+                    iceberg::io::GCS_DISABLE_CONFIG_LOAD.to_string(),
+                    "true".to_string(),
+                );
+                props.insert(
+                    iceberg::io::GCS_DISABLE_VM_METADATA.to_string(),
+                    "true".to_string(),
+                );
+                Arc::new(OpenDalStorageFactory::Gcs)
+            } else {
+                // DM(Jerry): GCS-with-HMAC path goes through the S3 protocol pointed at
+                // storage.googleapis.com — iceberg-rust's native GCS IO does not support
+                // HMAC keys (see Cargo.toml explaining the dual storage-gcs + services-s3
+                // feature). Factory side is S3 with scheme "gs", matching these S3-shaped props.
+                props.insert(
+                    iceberg::io::S3_ENDPOINT.to_string(),
+                    "https://storage.googleapis.com".to_string(),
+                );
+                props.insert(iceberg::io::S3_REGION.to_string(), region.clone());
+                props.insert(
+                    iceberg::io::S3_ACCESS_KEY_ID.to_string(),
+                    access_key_id.clone(),
+                );
+                props.insert(
+                    iceberg::io::S3_SECRET_ACCESS_KEY.to_string(),
+                    secret_access_key.clone(),
+                );
+                props.insert(
+                    iceberg::io::S3_DISABLE_CONFIG_LOAD.to_string(),
+                    "true".to_string(),
+                );
+                props.insert(
+                    iceberg::io::S3_DISABLE_EC2_METADATA.to_string(),
+                    "true".to_string(),
+                );
+                Arc::new(OpenDalStorageFactory::S3 {
+                    configured_scheme: "gs".to_string(),
+                    customized_credential_load: None,
+                })
             }
-
-            // Production environment.
-            let file_io_builder = FileIOBuilder::new("S3")
-                .with_prop(iceberg::io::S3_ENDPOINT, "https://storage.googleapis.com")
-                .with_prop(iceberg::io::S3_REGION, region)
-                .with_prop(iceberg::io::S3_ACCESS_KEY_ID, access_key_id)
-                .with_prop(iceberg::io::S3_SECRET_ACCESS_KEY, secret_access_key)
-                .with_prop(iceberg::io::S3_DISABLE_CONFIG_LOAD, "true")
-                .with_prop(iceberg::io::S3_DISABLE_EC2_METADATA, "true");
-            file_io_builder.build()
         }
         #[cfg(feature = "storage-s3")]
         StorageConfig::S3 {
@@ -142,18 +195,39 @@ pub(crate) fn create_file_io(accessor_config: &AccessorConfig) -> IcebergResult<
             endpoint,
             ..
         } => {
-            let mut file_io_builder = FileIOBuilder::new("s3")
-                .with_prop(iceberg::io::S3_REGION, region)
-                .with_prop(iceberg::io::S3_ACCESS_KEY_ID, access_key_id)
-                .with_prop(iceberg::io::S3_SECRET_ACCESS_KEY, secret_access_key)
-                .with_prop(iceberg::io::S3_DISABLE_CONFIG_LOAD, "true")
-                .with_prop(iceberg::io::S3_DISABLE_EC2_METADATA, "true");
+            props.insert(iceberg::io::S3_REGION.to_string(), region.clone());
+            props.insert(
+                iceberg::io::S3_ACCESS_KEY_ID.to_string(),
+                access_key_id.clone(),
+            );
+            props.insert(
+                iceberg::io::S3_SECRET_ACCESS_KEY.to_string(),
+                secret_access_key.clone(),
+            );
+            props.insert(
+                iceberg::io::S3_DISABLE_CONFIG_LOAD.to_string(),
+                "true".to_string(),
+            );
+            props.insert(
+                iceberg::io::S3_DISABLE_EC2_METADATA.to_string(),
+                "true".to_string(),
+            );
             if let Some(endpoint) = endpoint {
-                file_io_builder = file_io_builder.with_prop(iceberg::io::S3_ENDPOINT, endpoint);
+                props.insert(iceberg::io::S3_ENDPOINT.to_string(), endpoint.clone());
             }
-            file_io_builder.build()
+            Arc::new(OpenDalStorageFactory::S3 {
+                configured_scheme: "s3".to_string(),
+                customized_credential_load: None,
+            })
         }
-    }
+    };
+    Ok((factory, props))
+}
+
+/// Create a local filesystem [`FileIO`].
+#[cfg(feature = "storage-fs")]
+pub(crate) fn create_fs_file_io() -> FileIO {
+    FileIOBuilder::new(Arc::new(OpenDalStorageFactory::Fs)).build()
 }
 
 #[cfg(test)]

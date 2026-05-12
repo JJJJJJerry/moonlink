@@ -151,6 +151,10 @@ pub(crate) async fn create_table_impl(
     creation: TableCreation,
     iceberg_schema: IcebergSchema,
 ) -> IcebergResult<Table> {
+    // TODO(jerry): when enabling explicit V3 table creation, add a REST-catalog regression test
+    // around this path. The 2026-05-12 validation showed that pre-created Lakekeeper V3 metadata
+    // could not be loaded by moonlink, so the create + schema-normalization commit must prove it
+    // preserves/parses `format-version=3` end-to-end.
     let old_table = internal_catalog
         .create_table(namespace_ident, creation)
         .await?;

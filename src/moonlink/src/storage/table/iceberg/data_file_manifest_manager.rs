@@ -46,7 +46,10 @@ impl<'a> DataFileManifestManager<'a> {
         }
         let new_writer_builder =
             manifest_utils::create_manifest_writer_builder(self.table_metadata, self.file_io)?;
-        let new_writer = new_writer_builder.build_v2_data();
+        let new_writer = manifest_utils::build_data_manifest_writer(
+            new_writer_builder,
+            self.table_metadata.format_version(),
+        );
         self.writer = Some(new_writer);
         Ok(())
     }

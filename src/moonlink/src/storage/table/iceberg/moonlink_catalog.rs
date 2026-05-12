@@ -5,7 +5,7 @@ use iceberg::{Catalog, Result as IcebergResult, TableIdent};
 
 use std::collections::HashSet;
 
-use crate::storage::table::iceberg::puffin_writer_proxy::PuffinBlobMetadataProxy;
+use crate::storage::table::iceberg::puffin_writer_proxy::PuffinBlobMetadata;
 
 pub enum PuffinBlobType {
     DeletionVector,
@@ -20,7 +20,7 @@ pub trait PuffinWrite {
     fn record_puffin_metadata(
         &mut self,
         puffin_filepath: String,
-        puffin_metadata: Vec<PuffinBlobMetadataProxy>,
+        puffin_metadata: Vec<PuffinBlobMetadata>,
         puffin_blob_type: PuffinBlobType,
     );
 

@@ -17,7 +17,7 @@ use crate::storage::storage_utils::{
 use crate::storage::table::common::table_manager::{PersistenceFileParams, PersistenceResult};
 use crate::storage::table::iceberg::deletion_vector::DeletionVector;
 use crate::storage::table::iceberg::deletion_vector::{
-    DELETION_VECTOR_CADINALITY, DELETION_VECTOR_REFERENCED_DATA_FILE,
+    DELETION_VECTOR_CARDINALITY, DELETION_VECTOR_REFERENCED_DATA_FILE,
     MOONCAKE_DELETION_VECTOR_NUM_ROWS,
 };
 use crate::storage::table::iceberg::iceberg_table_manager::*;
@@ -27,7 +27,7 @@ use crate::storage::table::iceberg::moonlink_catalog::PuffinBlobType;
 use crate::storage::table::iceberg::puffin_utils;
 use crate::storage::table::iceberg::puffin_utils::PuffinBlobRef;
 use crate::storage::table::iceberg::puffin_writer_proxy::{
-    get_puffin_metadata_and_close, PuffinBlobMetadataProxy,
+    get_puffin_metadata_and_close, PuffinBlobMetadata,
 };
 use crate::storage::table::iceberg::schema_utils;
 use crate::storage::table::iceberg::utils::get_unique_hash_index_v1_filepath;
@@ -79,7 +79,7 @@ struct SingleFileIndexImportResult {
     /// File index.
     mooncake_file_index: MooncakeFileIndex,
     /// Puffin metadata.
-    puffin_metadata: Vec<PuffinBlobMetadataProxy>,
+    puffin_metadata: Vec<PuffinBlobMetadata>,
     /// Puffin filepath.
     puffin_filepath: String,
 }
@@ -97,7 +97,7 @@ struct PreparedDeletionVectorBlob {
     /// Puffin file path the blob is stored.
     puffin_filepath: String,
     /// Puffin metadata for the blob.
-    puffin_metadata: Option<Vec<PuffinBlobMetadataProxy>>,
+    puffin_metadata: Option<Vec<PuffinBlobMetadata>>,
     /// Deleted row count.
     deleted_row_count: usize,
 }
@@ -152,7 +152,9 @@ async fn import_one_file_index(
     puffin_writer
         .add(puffin_blob, iceberg::puffin::CompressionCodec::None)
         .await?;
-    let puffin_metadata = get_puffin_metadata_and_close(puffin_writer).await?;
+    let puffin_metadata =
+        get_puffin_metadata_and_close(iceberg_table.file_io(), &puffin_filepath, puffin_writer)
+            .await?;
 
     Ok(SingleFileIndexImportResult {
         local_index_file_to_remote,
@@ -405,7 +407,7 @@ impl IcebergTableManager {
                 iceberg_data_file.clone(),
             ),
             (
-                DELETION_VECTOR_CADINALITY.to_string(),
+                DELETION_VECTOR_CARDINALITY.to_string(),
                 deleted_row_count.to_string(),
             ),
             (
@@ -422,7 +424,12 @@ impl IcebergTableManager {
         )
         .await?;
         puffin_writer.add(blob, CompressionCodec::None).await?;
-        let puffin_metadata = get_puffin_metadata_and_close(puffin_writer).await?;
+        let puffin_metadata = get_puffin_metadata_and_close(
+            self.iceberg_table.as_ref().unwrap().file_io(),
+            &puffin_filepath,
+            puffin_writer,
+        )
+        .await?;
         Ok(PreparedDeletionVectorBlob {
             data_file,
             puffin_index,

@@ -19,7 +19,7 @@ const DELETION_VECTOR_MAGIC_BYTES: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
 const MIN_SERIALIZED_DELETION_VECTOR_BLOB: usize = 12;
 
 // Deletion vector puffin blob properties which must be contained.
-pub(crate) const DELETION_VECTOR_CADINALITY: &str = "cardinality";
+pub(crate) const DELETION_VECTOR_CARDINALITY: &str = "cardinality";
 pub(crate) const DELETION_VECTOR_REFERENCED_DATA_FILE: &str = "referenced-data-file";
 /// Used to bookkeep max number of rows for batch deletion vector.
 pub(crate) const MOONCAKE_DELETION_VECTOR_NUM_ROWS: &str = "mooncake-deletion-vector-max-num-rows";
@@ -68,8 +68,8 @@ impl DeletionVector {
     /// Sanity check required blob properties have been properly set.
     fn check_properties(properties: &HashMap<String, String>) {
         assert!(
-            properties.contains_key(DELETION_VECTOR_CADINALITY),
-            "Deletion vector blob properties should contain {DELETION_VECTOR_CADINALITY}"
+            properties.contains_key(DELETION_VECTOR_CARDINALITY),
+            "Deletion vector blob properties should contain {DELETION_VECTOR_CARDINALITY}"
         );
         assert!(
             properties.contains_key(DELETION_VECTOR_REFERENCED_DATA_FILE),
@@ -255,7 +255,7 @@ mod tests {
     fn create_test_blob_properties(deleted_rows: usize) -> HashMap<String, String> {
         let mut properties = HashMap::new();
         properties.insert(
-            DELETION_VECTOR_CADINALITY.to_string(),
+            DELETION_VECTOR_CARDINALITY.to_string(),
             deleted_rows.to_string(),
         );
         properties.insert(

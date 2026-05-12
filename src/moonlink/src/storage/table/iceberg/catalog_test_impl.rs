@@ -7,9 +7,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use iceberg::spec::{SnapshotReference, SnapshotRetention, MAIN_BRANCH};
-use iceberg::{
-    NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement, TableUpdate,
-};
+use iceberg::{NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate};
 
 /// This file contains testing logic which is general to all types of catalogs.
 ///
@@ -259,8 +257,7 @@ pub(crate) async fn test_update_table_impl(
         requirements: vec![],
         updates: table_updates,
     };
-    let table_commit =
-        unsafe { std::mem::transmute::<TableCommitProxy, TableCommit>(table_commit_proxy) };
+    let table_commit = table_commit_proxy.take_as_table_commit();
 
     // Check table metadata.
     let table = catalog.update_table(table_commit).await.unwrap();
@@ -318,8 +315,7 @@ pub(crate) async fn test_update_table_with_requirement_check_failed_impl(
         }],
         updates: vec![],
     };
-    let table_commit =
-        unsafe { std::mem::transmute::<TableCommitProxy, TableCommit>(table_commit_proxy) };
+    let table_commit = table_commit_proxy.take_as_table_commit();
 
     let res = catalog.update_table(table_commit).await;
     assert!(res.is_err());

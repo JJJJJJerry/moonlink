@@ -1,7 +1,7 @@
-// iceberg-rust currently doesn't support puffin related features, to write deletion vector into iceberg metadata, we need two things at least:
+// iceberg-rust currently doesn't support writing puffin metadata into manifests, so we keep
+// the manifest rewrite helpers here.
 // 1. the start offset and blob size for each deletion vector
 // 2. append blob metadata into manifest file
-// So here to workaround the limitation and to avoid/reduce changes to iceberg-rust ourselves, we use a few proxy types to reinterpret the memory directly.
 //
 // deletion vector spec:
 // issue collection: https://github.com/apache/iceberg/issues/11122
@@ -14,196 +14,48 @@
 use crate::storage::table::iceberg::manifest_utils::{self, ManifestEntryType};
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use crate::storage::table::iceberg::data_file_manifest_manager::DataFileManifestManager;
 use crate::storage::table::iceberg::deletion_vector_manifest_manager::DeletionVectorManifestManager;
 use crate::storage::table::iceberg::file_index_manifest_manager::FileIndexManifestManager;
 use iceberg::io::FileIO;
-use iceberg::puffin::{CompressionCodec, PuffinWriter};
-use iceberg::spec::{
-    DataContentType, DataFileFormat, Datum, FormatVersion, ManifestListWriter, Snapshot, Struct,
-    TableMetadata,
-};
+use iceberg::puffin::{BlobMetadata, PuffinReader, PuffinWriter};
+use iceberg::spec::{FormatVersion, ManifestListWriter, Snapshot, TableMetadata};
 use iceberg::Result as IcebergResult;
+use tracing::warn;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[allow(dead_code)]
-enum PuffinFlagProxy {
-    FooterPayloadCompressed = 0,
-}
+/// SPIKE 0 (2026-05-09): when set, skip registering hash-index puffin blobs in the file-index
+/// manifest. Used to validate the cross-engine read hypothesis — testing whether removing the
+/// out-of-spec Data+Puffin manifest entry unblocks Spark / pyiceberg readers.
+/// To revert: delete this static and the gating branch in `append_puffin_metadata_and_rewrite`.
+static SKIP_HASH_INDEX_MANIFEST: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("MOONCAKE_SKIP_HASH_INDEX_MANIFEST").is_ok());
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct PuffinBlobMetadataProxy {
-    pub(crate) r#type: String,
-    pub(crate) fields: Vec<i32>,
-    pub(crate) snapshot_id: i64,
-    pub(crate) sequence_number: i64,
-    pub(crate) offset: u64,
-    pub(crate) length: u64,
-    pub(crate) compression_codec: CompressionCodec,
-    pub(crate) properties: HashMap<String, String>,
-}
+pub(crate) type PuffinBlobMetadata = BlobMetadata;
 
-#[allow(dead_code)]
-struct PuffinWriterProxy {
-    writer: Box<dyn iceberg::io::FileWrite>,
-    is_header_written: bool,
-    num_bytes_written: u64,
-    written_blobs_metadata: Vec<PuffinBlobMetadataProxy>,
-    properties: HashMap<String, String>,
-    footer_compression_codec: CompressionCodec,
-    flags: std::collections::HashSet<PuffinFlagProxy>,
-}
-
-/// Data file carries data file path, partition tuple, metrics, …
-#[derive(Debug, PartialEq, Clone, Eq)]
-pub struct DataFileProxy {
-    /// field id: 134
-    ///
-    /// Type of content stored by the data file: data, equality deletes,
-    /// or position deletes (all v1 files are data files)
-    pub(crate) content: DataContentType,
-    /// field id: 100
-    ///
-    /// Full URI for the file with FS scheme
-    pub(crate) file_path: String,
-    /// field id: 101
-    ///
-    /// String file format name, `avro`, `orc`, `parquet`, or `puffin`
-    pub(crate) file_format: DataFileFormat,
-    /// field id: 102
-    ///
-    /// Partition data tuple, schema based on the partition spec output using
-    /// partition field ids for the struct field ids
-    pub(crate) partition: Struct,
-    /// field id: 103
-    ///
-    /// Number of records in this file, or the cardinality of a deletion vector
-    pub(crate) record_count: u64,
-    /// field id: 104
-    ///
-    /// Total file size in bytes
-    pub(crate) file_size_in_bytes: u64,
-    /// field id: 108
-    /// key field id: 117
-    /// value field id: 118
-    ///
-    /// Map from column id to the total size on disk of all regions that
-    /// store the column. Does not include bytes necessary to read other
-    /// columns, like footers. Leave null for row-oriented formats (Avro)
-    pub(crate) column_sizes: HashMap<i32, u64>,
-    /// field id: 109
-    /// key field id: 119
-    /// value field id: 120
-    ///
-    /// Map from column id to number of values in the column (including null
-    /// and NaN values)
-    pub(crate) value_counts: HashMap<i32, u64>,
-    /// field id: 110
-    /// key field id: 121
-    /// value field id: 122
-    ///
-    /// Map from column id to number of null values in the column
-    pub(crate) null_value_counts: HashMap<i32, u64>,
-    /// field id: 137
-    /// key field id: 138
-    /// value field id: 139
-    ///
-    /// Map from column id to number of NaN values in the column
-    pub(crate) nan_value_counts: HashMap<i32, u64>,
-    /// field id: 125
-    /// key field id: 126
-    /// value field id: 127
-    ///
-    /// Map from column id to lower bound in the column serialized as binary.
-    /// Each value must be less than or equal to all non-null, non-NaN values
-    /// in the column for the file.
-    ///
-    /// Reference:
-    ///
-    /// - [Binary single-value serialization](https://iceberg.apache.org/spec/#binary-single-value-serialization)
-    pub(crate) lower_bounds: HashMap<i32, Datum>,
-    /// field id: 128
-    /// key field id: 129
-    /// value field id: 130
-    ///
-    /// Map from column id to upper bound in the column serialized as binary.
-    /// Each value must be greater than or equal to all non-null, non-Nan
-    /// values in the column for the file.
-    ///
-    /// Reference:
-    ///
-    /// - [Binary single-value serialization](https://iceberg.apache.org/spec/#binary-single-value-serialization)
-    pub(crate) upper_bounds: HashMap<i32, Datum>,
-    /// field id: 131
-    ///
-    /// Implementation-specific key metadata for encryption
-    pub(crate) key_metadata: Option<Vec<u8>>,
-    /// field id: 132
-    /// element field id: 133
-    ///
-    /// Split offsets for the data file. For example, all row group offsets
-    /// in a Parquet file. Must be sorted ascending
-    pub(crate) split_offsets: Vec<i64>,
-    /// field id: 135
-    /// element field id: 136
-    ///
-    /// Field ids used to determine row equality in equality delete files.
-    /// Required when content is EqualityDeletes and should be null
-    /// otherwise. Fields with ids listed in this column must be present
-    /// in the delete file
-    pub(crate) equality_ids: Vec<i32>,
-    /// field id: 140
-    ///
-    /// ID representing sort order for this file.
-    ///
-    /// If sort order ID is missing or unknown, then the order is assumed to
-    /// be unsorted. Only data files and equality delete files should be
-    /// written with a non-null order id. Position deletes are required to be
-    /// sorted by file and position, not a table order, and should set sort
-    /// order id to null. Readers must ignore sort order id for position
-    /// delete files.
-    pub(crate) sort_order_id: Option<i32>,
-    /// field id: 142
-    ///
-    /// The _row_id for the first row in the data file.
-    /// For more details, refer to https://github.com/apache/iceberg/blob/main/format/spec.md#first-row-id-inheritance
-    pub(crate) first_row_id: Option<i64>,
-    /// This field is not included in spec. It is just store in memory representation used
-    /// in process.
-    pub(crate) partition_spec_id: i32,
-    /// field id: 143
-    ///
-    /// Fully qualified location (URI with FS scheme) of a data file that all deletes reference.
-    /// Position delete metadata can use `referenced_data_file` when all deletes tracked by the
-    /// entry are in a single data file. Setting the referenced file is required for deletion vectors.
-    pub(crate) referenced_data_file: Option<String>,
-    /// field: 144
-    ///
-    /// The offset in the file where the content starts.
-    /// The `content_offset` and `content_size_in_bytes` fields are used to reference a specific blob
-    /// for direct access to a deletion vector. For deletion vectors, these values are required and must
-    /// exactly match the `offset` and `length` stored in the Puffin footer for the deletion vector blob.
-    pub(crate) content_offset: Option<i64>,
-    /// field: 145
-    ///
-    /// The length of a referenced content stored in the file; required if `content_offset` is present
-    pub(crate) content_size_in_bytes: Option<i64>,
-}
-
-/// Get puffin blob metadata within the puffin write, and close the writer.
-/// This function is supposed to be called after all blobs added.
 pub(crate) async fn get_puffin_metadata_and_close(
+    file_io: &FileIO,
+    puffin_filepath: &str,
     puffin_writer: PuffinWriter,
-) -> IcebergResult<Vec<PuffinBlobMetadataProxy>> {
-    let puffin_writer_proxy =
-        unsafe { std::mem::transmute::<PuffinWriter, PuffinWriterProxy>(puffin_writer) };
-    let puffin_metadata = puffin_writer_proxy.written_blobs_metadata.clone();
-    let puffin_writer =
-        unsafe { std::mem::transmute::<PuffinWriterProxy, PuffinWriter>(puffin_writer_proxy) };
+) -> IcebergResult<Vec<PuffinBlobMetadata>> {
     puffin_writer.close().await?;
-    Ok(puffin_metadata)
+    let input_file = file_io.new_input(puffin_filepath)?;
+    let puffin_reader = PuffinReader::new(input_file);
+    let puffin_metadata = puffin_reader.file_metadata().await?;
+    Ok(puffin_metadata.blobs().to_vec())
+
+    // Previous transmute-based body (PR #71 era, removed in PR #2150):
+    //
+    // let proxy = unsafe {
+    //     std::mem::transmute::<PuffinWriter, PuffinWriterProxy>(puffin_writer)
+    // };
+    // let puffin_metadata = proxy.written_blobs_metadata.clone();
+    // let puffin_writer = unsafe {
+    //     std::mem::transmute::<PuffinWriterProxy, PuffinWriter>(proxy)
+    // };
+    // puffin_writer.close().await?;
+    // Ok(puffin_metadata)
 }
 
 /// Util function to create manifest list writer and delete current one.
@@ -216,19 +68,32 @@ async fn create_new_manifest_list_writer(
     let manifest_list_outfile = file_io.new_output(cur_snapshot.manifest_list())?;
 
     let latest_seq_no = table_metadata.last_sequence_number();
-    let manifest_list_writer = if table_metadata.format_version() == FormatVersion::V1 {
-        ManifestListWriter::v1(
+    let snapshot_id = cur_snapshot.snapshot_id();
+
+    // DM(Jerry): match (not if/else) so a future FormatVersion::V4 fails to compile here
+    // instead of silently downgrading the manifest-list header.
+    let manifest_list_writer = match table_metadata.format_version() {
+        FormatVersion::V1 => ManifestListWriter::v1(
             manifest_list_outfile,
-            cur_snapshot.snapshot_id(),
+            snapshot_id,
             /*parent_snapshot_id=*/ None,
-        )
-    } else {
-        ManifestListWriter::v2(
+        ),
+        FormatVersion::V2 => ManifestListWriter::v2(
             manifest_list_outfile,
-            cur_snapshot.snapshot_id(),
+            snapshot_id,
             /*parent_snapshot_id=*/ None,
             latest_seq_no,
-        )
+        ),
+        // TODO(Jerry): once row-lineage is enabled, plumb the real starting row id from
+        // cur_snapshot.first_row_id(). Passing None for now is enough to emit a valid V3
+        // manifest-list header (format-version=3, first-row-id=null).
+        FormatVersion::V3 => ManifestListWriter::v3(
+            manifest_list_outfile,
+            snapshot_id,
+            /*parent_snapshot_id=*/ None,
+            latest_seq_no,
+            /*first_row_id=*/ None,
+        ),
     };
     Ok(manifest_list_writer)
 }
@@ -253,8 +118,8 @@ async fn create_new_manifest_list_writer(
 pub(crate) async fn append_puffin_metadata_and_rewrite(
     table_metadata: &TableMetadata,
     file_io: &FileIO,
-    deletion_vector_blobs_to_add: &HashMap<String, Vec<PuffinBlobMetadataProxy>>,
-    file_index_blobs_to_add: &HashMap<String, Vec<PuffinBlobMetadataProxy>>,
+    deletion_vector_blobs_to_add: &HashMap<String, Vec<PuffinBlobMetadata>>,
+    file_index_blobs_to_add: &HashMap<String, Vec<PuffinBlobMetadata>>,
     data_files_to_remove: &HashSet<String>,
     index_puffin_blobs_to_remove: &HashSet<String>,
 ) -> IcebergResult<()> {
@@ -344,17 +209,14 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
 
     // Append puffin blobs into existing manifest entries.
     deletion_vector_manifest_manager.add_new_puffin_blobs(deletion_vector_blobs_to_add)?;
-    // SPIKE 0 (2026-05-09): env-gate hash-index 越界注册 to validate cross-engine read hypothesis.
-    // When MOONCAKE_SKIP_HASH_INDEX_MANIFEST=1, hash index puffin won't be registered as
-    // Data+Puffin manifest entry — testing whether removing this越界 unblocks Spark/pyiceberg.
-    // To revert: remove this if-block, keep the unconditional call.
-    if std::env::var("MOONCAKE_SKIP_HASH_INDEX_MANIFEST").is_err() {
-        file_index_manifest_manager.add_new_puffin_blobs(file_index_blobs_to_add)?;
-    } else {
-        eprintln!(
-            "[SPIKE 0] MOONCAKE_SKIP_HASH_INDEX_MANIFEST=1 — skipping hash index manifest registration ({} blobs)",
-            file_index_blobs_to_add.len()
+    // TODO(jerry)
+    if *SKIP_HASH_INDEX_MANIFEST {
+        warn!(
+            blob_count = file_index_blobs_to_add.len(),
+            "MOONCAKE_SKIP_HASH_INDEX_MANIFEST is set; skipping hash index manifest registration (SPIKE 0)"
         );
+    } else {
+        file_index_manifest_manager.add_new_puffin_blobs(file_index_blobs_to_add)?;
     }
 
     // Attempt to finalize all existing manifest entries.

@@ -3,7 +3,7 @@ use crate::storage::filesystem::accessor_config::AccessorConfig;
 use crate::storage::table::iceberg::catalog_utils::{create_table_impl, update_table_impl};
 use crate::storage::table::iceberg::iceberg_table_config::RestCatalogConfig;
 use crate::storage::table::iceberg::io_utils as iceberg_io_utils;
-use crate::storage::table::iceberg::puffin_writer_proxy::PuffinBlobMetadataProxy;
+use crate::storage::table::iceberg::puffin_writer_proxy::PuffinBlobMetadata;
 use crate::storage::table::iceberg::table_commit_proxy::TableCommitProxy;
 use crate::storage::table::iceberg::table_update_proxy::TableUpdateProxy;
 use async_trait::async_trait;
@@ -46,7 +46,9 @@ impl RestCatalog {
         accessor_config: AccessorConfig,
         iceberg_schema: IcebergSchema,
     ) -> IcebergResult<Self> {
-        let builder = IcebergRestCatalogBuilder::default();
+        let (factory, io_props) =
+            iceberg_io_utils::create_storage_factory_and_props(&accessor_config)?;
+        let builder = IcebergRestCatalogBuilder::default().with_storage_factory(factory);
         config
             .props
             .insert(REST_CATALOG_PROP_URI.to_string(), config.uri);
@@ -54,6 +56,7 @@ impl RestCatalog {
             REST_CATALOG_PROP_WAREHOUSE.to_string(),
             config.warehouse.clone(),
         );
+        config.props.extend(io_props);
         let warehouse_location = config.warehouse.clone();
         let catalog = builder.load(config.name, config.props).await?;
         let file_io = iceberg_io_utils::create_file_io(&accessor_config)?;
@@ -71,7 +74,9 @@ impl RestCatalog {
         mut config: RestCatalogConfig,
         accessor_config: AccessorConfig,
     ) -> IcebergResult<Self> {
-        let builder = IcebergRestCatalogBuilder::default();
+        let (factory, io_props) =
+            iceberg_io_utils::create_storage_factory_and_props(&accessor_config)?;
+        let builder = IcebergRestCatalogBuilder::default().with_storage_factory(factory);
         config
             .props
             .insert(REST_CATALOG_PROP_URI.to_string(), config.uri);
@@ -79,6 +84,7 @@ impl RestCatalog {
             REST_CATALOG_PROP_WAREHOUSE.to_string(),
             config.warehouse.clone(),
         );
+        config.props.extend(io_props);
         let warehouse_location = config.warehouse.clone();
         let catalog = builder.load(config.name, config.props).await?;
         let file_io = iceberg_io_utils::create_file_io(&accessor_config)?;
@@ -189,7 +195,7 @@ impl PuffinWrite for RestCatalog {
     fn record_puffin_metadata(
         &mut self,
         puffin_filepath: String,
-        puffin_metadata: Vec<PuffinBlobMetadataProxy>,
+        puffin_metadata: Vec<PuffinBlobMetadata>,
         puffin_blob_type: PuffinBlobType,
     ) {
         self.table_update_proxy.record_puffin_metadata(

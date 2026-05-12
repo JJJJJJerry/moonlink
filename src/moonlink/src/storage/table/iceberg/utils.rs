@@ -70,6 +70,9 @@ async fn create_iceberg_table<C: MoonlinkCatalog + ?Sized>(
     }
 
     let iceberg_schema = IcebergArrow::arrow_schema_to_schema(arrow_schema)?;
+    // TODO(jerry): accept an explicit Iceberg format version from table config and call
+    // `TableCreation::builder().format_version(...)` here. The current builder default is V2;
+    // V3-aware manifest writers below do not make newly-created tables V3 by themselves.
     let tbl_creation = TableCreation::builder()
         .name(table_name.to_string())
         .location(format!(
