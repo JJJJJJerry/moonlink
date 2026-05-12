@@ -1,5 +1,6 @@
 pub mod error;
 pub mod event_sync;
+pub mod index;
 pub mod lsn_state;
 pub mod mooncake_table_id;
 mod observability;

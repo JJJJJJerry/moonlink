@@ -22,7 +22,7 @@ const _MAX_BLOCK_SIZE: u32 = 2 * 1024 * 1024 * 1024; // 2GB
 const _TARGET_NUM_FILES_PER_INDEX: u32 = 4000;
 const INVALID_FILE_ID: u32 = 0xFFFFFFFF;
 
-pub(super) fn splitmix64(mut x: u64) -> u64 {
+pub(crate) fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E3779B97F4A7C15);
     let mut z = x;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
