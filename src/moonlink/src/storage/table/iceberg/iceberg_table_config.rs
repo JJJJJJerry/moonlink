@@ -165,6 +165,15 @@ pub struct IcebergTableConfig {
     pub data_accessor_config: AccessorConfig,
     /// Catalog configuration (defaults to File).
     pub metadata_accessor_config: IcebergCatalogConfig,
+    /// Phase B Mode 2a: base root for mooncake-private artifacts (hash-index manifest +
+    /// blocks). Must live **outside** the Iceberg table root — enforced by B-3 boot
+    /// validation. Per-table storage is `<private_index_root>/<table_uuid>/...`, where
+    /// `<table_uuid>` is read from the Iceberg `metadata.table-uuid` field (V2+).
+    /// `None` = legacy mode (no private root); B-1 still strips hash from Iceberg
+    /// manifest_list, so legacy tables degrade gracefully to "no hash index after restart"
+    /// rather than visibility bugs.
+    #[serde(default)]
+    pub private_index_root: Option<String>,
 }
 
 impl IcebergTableConfig {
@@ -187,6 +196,7 @@ impl Default for IcebergTableConfig {
             metadata_accessor_config: IcebergCatalogConfig::File {
                 accessor_config: AccessorConfig::new_with_storage_config(storage_config),
             },
+            private_index_root: None,
         }
     }
 }

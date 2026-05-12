@@ -70,6 +70,7 @@ fn bench_write(c: &mut Criterion) {
                         ),
                     },
                     ..Default::default()
+                    private_index_root: None,
                 };
                 let mut table_config =
                     MooncakeTableConfig::new(temp_dir.path().to_str().unwrap().to_string());
@@ -128,6 +129,7 @@ fn bench_write(c: &mut Criterion) {
                         ),
                     },
                     ..Default::default()
+                    private_index_root: None,
                 };
                 let mut table_config =
                     MooncakeTableConfig::new(temp_dir.path().to_str().unwrap().to_string());
@@ -189,6 +191,7 @@ fn bench_write(c: &mut Criterion) {
                         ),
                     },
                     ..Default::default()
+                    private_index_root: None,
                 };
                 let mut table_config =
                     MooncakeTableConfig::new(temp_dir.path().to_str().unwrap().to_string());

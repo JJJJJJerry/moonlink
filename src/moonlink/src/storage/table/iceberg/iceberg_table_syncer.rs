@@ -22,8 +22,12 @@ use crate::storage::table::iceberg::deletion_vector::{
 };
 use crate::storage::table::iceberg::iceberg_table_manager::*;
 use crate::storage::table::iceberg::index::FileIndexBlob;
+use crate::storage::table::iceberg::index::MOONCAKE_HASH_INDEX_V1_CARDINALITY;
 use crate::storage::table::iceberg::io_utils as iceberg_io_utils;
 use crate::storage::table::iceberg::moonlink_catalog::PuffinBlobType;
+use crate::storage::table::iceberg::private_manifest::{
+    HashIndexEntry, PrivateManifest, PrivateManifestStore,
+};
 use crate::storage::table::iceberg::puffin_utils;
 use crate::storage::table::iceberg::puffin_utils::PuffinBlobRef;
 use crate::storage::table::iceberg::puffin_writer_proxy::{
@@ -832,6 +836,12 @@ impl IcebergTableManager {
         };
         self.iceberg_table = Some(updated_iceberg_table);
 
+        // Phase B (B-commit-integration): persist hash-index puffin pointers to the
+        // mooncake-private manifest (Mode 2a). Drain *before* `clear_puffin_metadata`
+        // so the blobs aren't lost; deletion-vector / removal sets are cleared as before.
+        let file_index_blobs = self.catalog.take_file_index_blobs_to_add();
+        self.persist_private_manifest(file_index_blobs).await?;
+
         self.catalog.clear_puffin_metadata();
 
         // NOTICE: persisted data files and file indices are returned in the order of (1) newly imported ones; (2) index merge ones; (3) data compacted ones.
@@ -841,5 +851,62 @@ impl IcebergTableManager {
             remote_file_indices,
             evicted_files_to_delete: deletion_vectors_sync_result.evicted_files_to_delete,
         })
+    }
+
+    /// Persist hash-index puffin pointers to the mooncake-private manifest store.
+    ///
+    /// No-op when:
+    /// - `private_index_root` is unconfigured (legacy / non-Mode-2a tables), or
+    /// - no file-index blobs were produced this commit.
+    ///
+    /// Uses `self.filesystem_accessor` for I/O, which implies the private root must
+    /// live on the same backend / credentials as the data root for now. Cross-bucket
+    /// private roots require a separate accessor and are deferred.
+    async fn persist_private_manifest(
+        &self,
+        file_index_blobs: HashMap<String, Vec<PuffinBlobMetadata>>,
+    ) -> Result<()> {
+        let Some(private_root) = self.config.private_index_root.as_deref() else {
+            return Ok(());
+        };
+        if file_index_blobs.is_empty() {
+            return Ok(());
+        }
+
+        let metadata = self.iceberg_table.as_ref().unwrap().metadata();
+        let snapshot_id = match metadata.current_snapshot() {
+            Some(snap) => snap.snapshot_id(),
+            // No snapshot means there's nothing to anchor against — skip; the next
+            // non-empty commit will write a manifest covering the same blobs.
+            None => return Ok(()),
+        };
+        let table_uuid = metadata.uuid();
+
+        let mut entries: Vec<HashIndexEntry> = Vec::new();
+        for (puffin_file_path, blobs) in file_index_blobs.into_iter() {
+            for blob in blobs.iter() {
+                let cardinality = blob
+                    .properties()
+                    .get(MOONCAKE_HASH_INDEX_V1_CARDINALITY)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0);
+                entries.push(HashIndexEntry {
+                    puffin_file_path: puffin_file_path.clone(),
+                    blob_offset: blob.offset() as u64,
+                    blob_size: blob.length() as u64,
+                    blob_type: blob.blob_type().to_string(),
+                    cardinality,
+                });
+            }
+        }
+
+        let store = PrivateManifestStore::new(
+            self.filesystem_accessor.clone(),
+            private_root.to_string(),
+            table_uuid,
+        );
+        let manifest = PrivateManifest::new(snapshot_id, table_uuid, entries);
+        store.write_snap_manifest(&manifest).await?;
+        Ok(())
     }
 }

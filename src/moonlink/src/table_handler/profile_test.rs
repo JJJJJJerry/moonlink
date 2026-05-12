@@ -423,6 +423,7 @@ fn get_iceberg_table_config_with_storage_config(
         table_name: ICEBERG_TEST_TABLE.to_string(),
         data_accessor_config: accessor_config.clone(),
         metadata_accessor_config: crate::IcebergCatalogConfig::File { accessor_config },
+        private_index_root: None,
     }
 }
 

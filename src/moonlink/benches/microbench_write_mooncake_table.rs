@@ -68,6 +68,7 @@ fn bench_write_mooncake_table(c: &mut Criterion) {
                 },
             ),
         },
+        private_index_root: None,
     };
     let rt = Runtime::new().unwrap();
     let mut table_config = MooncakeTableConfig::new(temp_dir.path().to_str().unwrap().to_string());

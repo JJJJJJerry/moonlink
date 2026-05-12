@@ -29,6 +29,7 @@ pub fn get_s3_moonlink_table_config(database: &str, table: &str) -> MoonlinkTabl
             metadata_accessor_config: IcebergCatalogConfig::File {
                 accessor_config: AccessorConfig::new_with_storage_config(iceberg_storage.clone()),
             },
+            private_index_root: None,
         },
         wal_table_config: WalConfig::new(wal_accessor, &format!("{database}.{table}")),
         ..Default::default()
@@ -66,6 +67,7 @@ pub fn get_gcs_moonlink_table_config(database: &str, table: &str) -> MoonlinkTab
             metadata_accessor_config: IcebergCatalogConfig::File {
                 accessor_config: AccessorConfig::new_with_storage_config(iceberg_storage.clone()),
             },
+            private_index_root: None,
         },
         wal_table_config: WalConfig::new(wal_accessor, &format!("{database}.{table}")),
         ..Default::default()

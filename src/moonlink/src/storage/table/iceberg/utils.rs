@@ -61,6 +61,7 @@ async fn create_iceberg_table<C: MoonlinkCatalog + ?Sized>(
     table_name: &str,
     namespace_ident: NamespaceIdent,
     arrow_schema: &ArrowSchema,
+    private_index_root: Option<&str>,
 ) -> IcebergResult<IcebergTable> {
     let namespace_already_exists = catalog.namespace_exists(&namespace_ident).await?;
     if !namespace_already_exists {
@@ -82,7 +83,9 @@ async fn create_iceberg_table<C: MoonlinkCatalog + ?Sized>(
             table_name
         ))
         .schema(iceberg_schema)
-        .properties(table_property::create_iceberg_table_properties())
+        .properties(table_property::create_iceberg_table_properties(
+            private_index_root,
+        ))
         .build();
     let table = catalog.create_table(&namespace_ident, tbl_creation).await?;
     Ok(table)
@@ -100,6 +103,7 @@ pub(crate) async fn get_or_create_iceberg_table<C: MoonlinkCatalog + ?Sized>(
     namespace: &Vec<String>,
     table_name: &str,
     arrow_schema: &ArrowSchema,
+    private_index_root: Option<&str>,
 ) -> IcebergResult<IcebergTable> {
     let namespace_ident = NamespaceIdent::from_strs(namespace).unwrap();
     let table_ident = TableIdent::new(namespace_ident.clone(), table_name.to_string());
@@ -117,6 +121,7 @@ pub(crate) async fn get_or_create_iceberg_table<C: MoonlinkCatalog + ?Sized>(
             table_name,
             namespace_ident,
             arrow_schema,
+            private_index_root,
         )
         .await
     } else {

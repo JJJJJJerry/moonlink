@@ -22,6 +22,7 @@ pub(crate) fn get_moonlink_table_config() -> MoonlinkTableConfig {
             metadata_accessor_config: moonlink::IcebergCatalogConfig::File {
                 accessor_config: iceberg_accessor_config,
             },
+            private_index_root: None,
         },
         wal_table_config: WalConfig::new(wal_accessor_config, "dst-database.dst-schema.dst-table"),
         ..Default::default()

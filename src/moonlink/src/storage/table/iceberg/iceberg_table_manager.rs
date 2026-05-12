@@ -165,6 +165,7 @@ impl IcebergTableManager {
                 &self.config.namespace,
                 &self.config.table_name,
                 self.mooncake_table_metadata.schema.as_ref(),
+                self.config.private_index_root.as_deref(),
             )
             .await?;
             self.iceberg_table = Some(table);

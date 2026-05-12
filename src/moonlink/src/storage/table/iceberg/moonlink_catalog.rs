@@ -3,7 +3,7 @@ use iceberg::spec::{Schema as IcebergSchema, TableMetadata};
 use iceberg::table::Table;
 use iceberg::{Catalog, Result as IcebergResult, TableIdent};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::storage::table::iceberg::puffin_writer_proxy::PuffinBlobMetadata;
 
@@ -32,6 +32,14 @@ pub trait PuffinWrite {
 
     /// After transaction commits, puffin metadata should be cleared for next puffin write.
     fn clear_puffin_metadata(&mut self);
+
+    /// Move out file-index puffin blob metadata recorded for the current transaction.
+    ///
+    /// Phase B (B-commit-integration): hash-index blobs no longer enter the Iceberg
+    /// `manifest_list` (B-1); the syncer drains them here right after `txn.commit`
+    /// and persists them to a mooncake-private manifest (Mode 2a). Calling this
+    /// leaves the deletion-vector / removal sets intact for `clear_puffin_metadata`.
+    fn take_file_index_blobs_to_add(&mut self) -> HashMap<String, Vec<PuffinBlobMetadata>>;
 }
 
 /// TODO(hjiang): iceberg-rust currently doesn't support schema evolution, to workaround and reduce code change,

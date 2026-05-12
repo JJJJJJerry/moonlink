@@ -57,6 +57,7 @@ fn create_iceberg_table_config(warehouse_uri: String) -> IcebergTableConfig {
         metadata_accessor_config: IcebergCatalogConfig::Glue {
             glue_catalog_config,
         },
+        private_index_root: None,
     }
 }
 

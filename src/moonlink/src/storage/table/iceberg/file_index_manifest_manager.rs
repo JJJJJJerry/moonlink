@@ -1,18 +1,11 @@
-use crate::storage::table::iceberg::index::{
-    MOONCAKE_HASH_INDEX_V1, MOONCAKE_HASH_INDEX_V1_CARDINALITY,
-};
 use crate::storage::table::iceberg::manifest_utils;
 use crate::storage::table::iceberg::manifest_utils::ManifestEntryType;
-use crate::storage::table::iceberg::puffin_writer_proxy::PuffinBlobMetadata;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use iceberg::io::FileIO;
-use iceberg::spec::{
-    DataContentType, DataFile, ManifestEntry, ManifestFile, ManifestMetadata, ManifestWriter,
-    TableMetadata,
-};
+use iceberg::spec::{ManifestEntry, ManifestFile, ManifestMetadata, ManifestWriter, TableMetadata};
 use iceberg::Result as IcebergResult;
 
 pub(crate) struct FileIndexManifestManager<'a> {
@@ -80,24 +73,11 @@ impl<'a> FileIndexManifestManager<'a> {
         Ok(())
     }
 
-    pub(crate) fn add_new_puffin_blobs(
-        &mut self,
-        file_index_blobs_to_add: &HashMap<String, Vec<PuffinBlobMetadata>>,
-    ) -> IcebergResult<()> {
-        for (puffin_filepath, blob_metadata) in file_index_blobs_to_add.iter() {
-            for cur_blob_metadata in blob_metadata.iter() {
-                let data_file = get_data_file_for_file_index(puffin_filepath, cur_blob_metadata)?;
-                self.init_writer_for_once()?;
-                self.writer
-                    .as_mut()
-                    .unwrap()
-                    .add_file(data_file, cur_blob_metadata.sequence_number())?;
-            }
-        }
-        Ok(())
-    }
-
     /// Finalize the current manifest file and return.
+    ///
+    /// DM(Jerry) B-1: only emits a manifest file when legacy `add_manifest_entries` was
+    /// invoked (existing file-index entries surviving the prune filter). Fresh hash blobs
+    /// no longer enter the Iceberg manifest chain — they flow to PrivateManifestStore.
     pub(crate) async fn finalize(self) -> IcebergResult<Option<ManifestFile>> {
         if let Some(writer) = self.writer {
             let manifest_file = writer.write_manifest_file().await?;
@@ -105,19 +85,4 @@ impl<'a> FileIndexManifestManager<'a> {
         }
         Ok(None)
     }
-}
-
-/// Util function to get `DataFile` for new file index puffin blob.
-fn get_data_file_for_file_index(
-    puffin_filepath: &str,
-    blob_metadata: &PuffinBlobMetadata,
-) -> IcebergResult<DataFile> {
-    assert_eq!(blob_metadata.blob_type(), MOONCAKE_HASH_INDEX_V1);
-    manifest_utils::build_puffin_data_file(
-        puffin_filepath,
-        blob_metadata,
-        DataContentType::Data,
-        MOONCAKE_HASH_INDEX_V1_CARDINALITY,
-        None,
-    )
 }

@@ -14,7 +14,6 @@
 use crate::storage::table::iceberg::manifest_utils::{self, ManifestEntryType};
 
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
 
 use crate::storage::table::iceberg::data_file_manifest_manager::DataFileManifestManager;
 use crate::storage::table::iceberg::deletion_vector_manifest_manager::DeletionVectorManifestManager;
@@ -23,14 +22,6 @@ use iceberg::io::FileIO;
 use iceberg::puffin::{BlobMetadata, PuffinReader, PuffinWriter};
 use iceberg::spec::{FormatVersion, ManifestListWriter, Snapshot, TableMetadata};
 use iceberg::Result as IcebergResult;
-use tracing::warn;
-
-/// SPIKE 0 (2026-05-09): when set, skip registering hash-index puffin blobs in the file-index
-/// manifest. Used to validate the cross-engine read hypothesis — testing whether removing the
-/// out-of-spec Data+Puffin manifest entry unblocks Spark / pyiceberg readers.
-/// To revert: delete this static and the gating branch in `append_puffin_metadata_and_rewrite`.
-static SKIP_HASH_INDEX_MANIFEST: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("MOONCAKE_SKIP_HASH_INDEX_MANIFEST").is_ok());
 
 pub(crate) type PuffinBlobMetadata = BlobMetadata;
 
@@ -209,15 +200,12 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
 
     // Append puffin blobs into existing manifest entries.
     deletion_vector_manifest_manager.add_new_puffin_blobs(deletion_vector_blobs_to_add)?;
-    // TODO(jerry)
-    if *SKIP_HASH_INDEX_MANIFEST {
-        warn!(
-            blob_count = file_index_blobs_to_add.len(),
-            "MOONCAKE_SKIP_HASH_INDEX_MANIFEST is set; skipping hash index manifest registration (SPIKE 0)"
-        );
-    } else {
-        file_index_manifest_manager.add_new_puffin_blobs(file_index_blobs_to_add)?;
-    }
+    // DM(Jerry) B-1: hash-index puffin blobs are no longer registered into the Iceberg
+    // standard manifest_list — that entry shape (Data + Puffin) is out-of-spec and breaks
+    // Spark / pyiceberg readers. New hash blobs flow to Mode 2a PrivateManifestStore in B-2.
+    // The legacy ManifestEntryType::FileIndex pruning path above is retained so existing
+    // tables (created pre-B-1) can still expire their old file-index manifest entries.
+    let _ = file_index_blobs_to_add; // routed to private manifest in B-commit-integration
 
     // Attempt to finalize all existing manifest entries.
     if let Some(manifest_file) = data_file_manifest_manager.finalize().await? {
