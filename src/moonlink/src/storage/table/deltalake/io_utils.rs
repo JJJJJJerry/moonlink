@@ -11,7 +11,8 @@ fn generate_unique_data_filepath(table: &DeltaTable, local_filepath: &String) ->
         .to_str()
         .unwrap()
         .to_string();
-    let table_uri = table.table_uri();
+    // DM(Jerry): deltalake 0.31 renamed `table_uri()` -> `table_url()`; returns Url not String.
+    let table_uri = table.table_url();
     let remote_filepath = format!(
         "{}.{}-{}.parquet",
         table_uri,
