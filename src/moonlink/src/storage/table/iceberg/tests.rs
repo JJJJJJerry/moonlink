@@ -1422,9 +1422,10 @@ async fn test_hash_index_private_manifest_is_cross_engine_safe() {
 ///
 /// The "every new hash-puffin has a marker" invariant from the earlier
 /// pre-write regression is no longer observable here once `commit_success`
-/// runs — that direction will be re-established by the failure-injection test
-/// (`test_b5d_persist_failure_preserves_catalog_blobs` below) and by the
-/// B-5e negative path, which exercises markers in their persisted state.
+/// runs — that direction will be re-established by the chaos-infra scenario
+/// `persist_failure_preserves_catalog_blobs` (see IMPLEMENTATION_PLAN.md
+/// §B-9) and by the boot reconciliation negative path, which exercises
+/// markers in their persisted state.
 #[tokio::test]
 async fn test_b5d_marker_dir_cleared_after_commit_success() {
     let iceberg_temp_dir = tempdir().unwrap();
@@ -1529,20 +1530,21 @@ async fn test_b5d_marker_dir_cleared_after_commit_success() {
 // NOTE: a session-level failure-injection test for the `peek -> persist ->
 // drain-on-success` ordering (deliberately corrupting the private root mid-
 // commit and checking that the catalog's file-index blob metadata survives
-// for the retry) was prototyped during B-5d but does not fit here: mooncake's
-// test framework follows the production "single-writer, fail-fatal" model and
-// does not return the iceberg table manager to the table on a persist error,
-// so a retry triggers an unrelated `take().unwrap()` panic before the
-// invariant can be observed.
+// for the retry) does not fit at this layer: mooncake's test framework
+// follows the production "single-writer, fail-fatal" model and does not
+// return the iceberg table manager to the table on a persist error, so a
+// retry inside the same session triggers an unrelated `take().unwrap()`
+// panic before the invariant can be observed.
 //
-// Direct-API testing (constructing PersistenceSnapshotPayload by hand +
+// Direct-API testing (constructing PersistenceSnapshotPayload by hand and
 // driving IcebergTableManager::sync_snapshot directly) would work but costs
-// ~150 LOC of fixture-setup for a single assertion. The proper home is the
-// chaos test infrastructure landing alongside B-5e, where a "kill mid-commit
-// + reopen" cycle is first-class. Until then, the invariant is held by the
-// load-bearing comment at the syncer call site in `iceberg_table_syncer.rs`
-// (search "Drain catalog state only after persistence succeeds") and by
-// inspection-level review.
+// ~150 LOC of fixture setup for a single assertion. The proper home is the
+// chaos test infrastructure landing alongside the boot reconciliation
+// work, where "kill mid-commit + reopen" is first-class — tracked in
+// IMPLEMENTATION_PLAN.md §B-9 as the `persist_failure_preserves_catalog_blobs`
+// scenario. Until that lands, the invariant is held by the load-bearing
+// INVARIANT comment at the syncer call site in `iceberg_table_syncer.rs`
+// (search "INVARIANT — peek before persist") and by inspection-level review.
 
 #[tokio::test]
 async fn test_private_index_root_inside_table_root_rejected_on_write() {

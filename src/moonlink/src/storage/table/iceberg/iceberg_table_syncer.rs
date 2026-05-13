@@ -971,9 +971,22 @@ impl IcebergTableManager {
         // Sweep the marker dir now that both txn.commit and write_snap_manifest
         // have succeeded — at this point Iceberg's live set and the private
         // manifest both anchor this snapshot, so the markers no longer carry
-        // recovery information. Failure to reach here leaves the dir behind for
-        // the boot reconciliation path to reap.
-        marker_dir.commit_success(snapshot_id).await?;
+        // recovery information.
+        //
+        // Cleanup is best-effort: failing here would surface to the caller as a
+        // persist error and trigger a bgworker restart for a snapshot whose
+        // durable state is already correct (manifest on disk, Iceberg snapshot
+        // live). A stuck marker dir is benign — `scan_hanging` ignores it
+        // because the snapshot is live, and the retention sweeper reaps
+        // "manifest present + marker dir present" as a separate orphan class.
+        if let Err(err) = marker_dir.commit_success(snapshot_id).await {
+            tracing::warn!(
+                snapshot_id,
+                error = %err,
+                "marker dir cleanup failed after successful commit; \
+                 leaving markers for the retention sweeper"
+            );
+        }
         Ok(())
     }
 }
