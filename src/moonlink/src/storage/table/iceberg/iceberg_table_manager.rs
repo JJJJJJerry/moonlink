@@ -192,7 +192,7 @@ impl IcebergTableManager {
     /// (the physical storage backend), which holds the real root path. For local
     /// filesystem storage we prepend `file://` to produce a valid `file:///path` URI.
     /// Cloud storage configs (S3 → `s3://`, GCS → `gs://`) already carry a scheme.
-    fn table_data_base_uri(&self) -> String {
+    pub(super) fn table_data_base_uri(&self) -> String {
         #[cfg(feature = "catalog-rest")]
         if matches!(
             &self.config.metadata_accessor_config,

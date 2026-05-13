@@ -208,6 +208,37 @@ impl BaseFileSystemAccess for FileSystemAccessor {
         Ok(dirs)
     }
 
+    async fn list_direct_files(&self, folder: &str) -> Result<Vec<String>> {
+        // Trim the leading `/` left by sanitize_path so opendal's `services::Fs`
+        // resolves the prefix relative to its configured root instead of the
+        // filesystem absolute root.
+        let sanitized_folder = self.sanitize_path(folder).trim_start_matches('/');
+        let prefix = format!("{sanitized_folder}/");
+        let lister = match self.get_operator().await?.list(&prefix).await {
+            Ok(lister) => lister,
+            // A missing prefix is "no files" rather than an error: object stores
+            // have no concept of an empty directory, and callers should not have to
+            // pre-check object_exists (which is false for dirs on local FS anyway).
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut files = Vec::new();
+        for cur_entry in lister.iter() {
+            // Skip sub-directories (their path ends in '/') and the prefix marker entry.
+            let path = cur_entry.path();
+            if path.ends_with('/') {
+                continue;
+            }
+            let name = path.trim_start_matches(&prefix).to_string();
+            // Only direct children — exclude anything that descended into a sub-directory.
+            if name.is_empty() || name.contains('/') {
+                continue;
+            }
+            files.push(name);
+        }
+        Ok(files)
+    }
+
     // TODO(hjiang): Remove this test function once fake-gcs fix the sending empty body will be error issue.
     #[cfg(all(feature = "storage-gcs", test))]
     async fn remove_directory(&self, directory: &str) -> Result<()> {

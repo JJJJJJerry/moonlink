@@ -17,10 +17,11 @@
 //! be rebuilt from data files + cost-gating fallback at query time).
 
 use crate::storage::filesystem::accessor::base_filesystem_accessor::BaseFileSystemAccess;
-use crate::Result;
+use crate::{Error, Result};
 
 use std::sync::Arc;
 
+use moonlink_error::{ErrorStatus, ErrorStruct};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -122,6 +123,24 @@ impl PrivateManifestStore {
         }
         let bytes = self.fs.read_object(&path).await?;
         let manifest: PrivateManifest = serde_json::from_slice(&bytes)?;
+        if manifest.schema_version != PRIVATE_MANIFEST_FORMAT_V1 {
+            return Err(Error::IcebergError(ErrorStruct::new(
+                format!(
+                    "Unsupported mooncake private manifest schema version {} at {path}",
+                    manifest.schema_version
+                ),
+                ErrorStatus::Permanent,
+            )));
+        }
+        if manifest.table_uuid != self.table_uuid {
+            return Err(Error::IcebergError(ErrorStruct::new(
+                format!(
+                    "Mooncake private manifest table UUID mismatch at {path}: expected {}, got {}",
+                    self.table_uuid, manifest.table_uuid
+                ),
+                ErrorStatus::Permanent,
+            )));
+        }
         Ok(Some(manifest))
     }
 
@@ -129,11 +148,10 @@ impl PrivateManifestStore {
     /// Caller is responsible for cross-checking against the live Iceberg snapshot set
     /// (B-5 sweeper / boot rebuild).
     pub(crate) async fn list_snapshot_ids(&self) -> Result<Vec<i64>> {
-        let dir = self.manifest_dir();
-        if !self.fs.object_exists(&dir).await.unwrap_or(false) {
-            return Ok(Vec::new());
-        }
-        let entries = self.fs.list_direct_subdirectories(&dir).await?;
+        // Manifest entries are `snap-<id>.json` *files*. `list_direct_files` treats a
+        // missing prefix as "no manifests yet" so the empty-store case lands here as
+        // Ok([]) without callers needing a separate existence check.
+        let entries = self.fs.list_direct_files(&self.manifest_dir()).await?;
         let mut out = Vec::new();
         for entry in entries {
             if let Some(id) = parse_snap_filename(&entry) {
@@ -216,13 +234,13 @@ pub(crate) fn validate_deployment(
     private_index_root: &str,
     controlled_beta_signoff: Option<&str>,
 ) -> std::result::Result<DeploymentStatus, DeploymentValidationError> {
-    let iceberg = iceberg_table_root.trim_end_matches('/');
-    let private = private_index_root.trim_end_matches('/');
+    let iceberg = normalize_deployment_root(iceberg_table_root);
+    let private = normalize_deployment_root(private_index_root);
 
     // "Under" check: private root must not equal the Iceberg root or sit beneath it.
     let is_under = private == iceberg
         || private
-            .strip_prefix(iceberg)
+            .strip_prefix(&iceberg)
             .map(|rest| rest.starts_with('/'))
             .unwrap_or(false);
 
@@ -237,9 +255,16 @@ pub(crate) fn validate_deployment(
         }
     }
     Err(DeploymentValidationError::InsidePathWithoutSignoff {
-        private_root: private.to_string(),
-        iceberg_root: iceberg.to_string(),
+        private_root: private,
+        iceberg_root: iceberg,
     })
+}
+
+fn normalize_deployment_root(root: &str) -> String {
+    root.strip_prefix("file://")
+        .unwrap_or(root)
+        .trim_end_matches('/')
+        .to_string()
 }
 
 #[cfg(test)]
@@ -312,6 +337,49 @@ mod tests {
         // sibling, not a child — must be accepted as Path (a).
         let status = validate_deployment("s3://wh/db/tbl", "s3://wh/db/tbl_index/", None).unwrap();
         assert_eq!(status, DeploymentStatus::Compliant);
+    }
+
+    #[test]
+    fn validate_file_scheme_and_plain_path_are_comparable() {
+        let err = validate_deployment("file:///tmp/wh/db/tbl", "/tmp/wh/db/tbl/_mooncake", None)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DeploymentValidationError::InsidePathWithoutSignoff { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn list_snapshot_ids_round_trips_written_files() {
+        use crate::storage::filesystem::accessor::filesystem_accessor::FileSystemAccessor;
+        use tempfile::tempdir;
+
+        let temp = tempdir().unwrap();
+        let fs = FileSystemAccessor::default_for_test(&temp);
+        let uuid = Uuid::new_v4();
+        let store =
+            PrivateManifestStore::new(fs.clone(), temp.path().to_str().unwrap().to_string(), uuid);
+
+        // Empty store → empty list. Guards against the older bug where listing was
+        // routed through `list_direct_subdirectories` and silently returned [].
+        assert!(store.list_snapshot_ids().await.unwrap().is_empty());
+
+        for snap_id in [1_i64, 42, 1234] {
+            store
+                .write_snap_manifest(&PrivateManifest::new(snap_id, uuid, Vec::new()))
+                .await
+                .unwrap();
+        }
+
+        let mut got = store.list_snapshot_ids().await.unwrap();
+        got.sort();
+        assert_eq!(got, vec![1, 42, 1234]);
+
+        // delete_snap_manifest should reflect in subsequent listings.
+        store.delete_snap_manifest(42).await.unwrap();
+        let mut got = store.list_snapshot_ids().await.unwrap();
+        got.sort();
+        assert_eq!(got, vec![1, 1234]);
     }
 
     #[test]

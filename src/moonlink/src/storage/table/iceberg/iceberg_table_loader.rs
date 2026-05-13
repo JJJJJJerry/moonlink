@@ -15,7 +15,7 @@ use crate::storage::table::iceberg::puffin_utils::PuffinBlobRef;
 #[cfg(any(test, debug_assertions))]
 use crate::storage::table::iceberg::schema_utils;
 use crate::storage::table::iceberg::snapshot_utils;
-use crate::storage::table::iceberg::table_property::MOONCAKE_PRIVATE_INDEX_ROOT;
+use crate::storage::table::iceberg::table_property;
 use crate::storage::table::iceberg::utils;
 use crate::storage::table::iceberg::validation as IcebergValidation;
 use crate::Result;
@@ -83,10 +83,13 @@ impl IcebergTableManager {
     /// created with private-root binding), classifies the deployment, logs the
     /// outcome, and fails recovery when the table sits inside the Iceberg root
     /// without a signoff (Path c).
-    fn validate_private_root_deployment(&self) -> Result<()> {
+    pub(super) fn validate_private_root_deployment(&self) -> Result<()> {
         let iceberg_table = self.iceberg_table.as_ref().unwrap();
         let metadata = iceberg_table.metadata();
-        let Some(private_root) = metadata.properties().get(MOONCAKE_PRIVATE_INDEX_ROOT) else {
+        let Some(private_root) = table_property::get_bound_private_index_root(
+            metadata.properties(),
+            self.config.private_index_root.as_deref(),
+        ) else {
             return Ok(());
         };
         let iceberg_root = iceberg_table.identifier().to_string();
@@ -94,9 +97,11 @@ impl IcebergTableManager {
             .properties()
             .get(MOONCAKE_CONTROLLED_BETA_SIGNOFF)
             .map(String::as_str);
-        // Use the Iceberg table location (metadata.location) for prefix comparison —
-        // that's the physical root that downstream Iceberg cleanup tools (RemoveOrphanFiles
-        // etc.) operate on.
+        // `metadata.location()` is the only root that downstream Iceberg cleanup
+        // (RemoveOrphanFiles, lifecycle policies, third-party governance) actually
+        // walks, so it is the only one that defines the threat surface. The convention
+        // path `warehouse/<ns>/<table>` may differ for custom-location / externally
+        // registered tables; we deliberately ignore it here to avoid false positives.
         let physical_root = metadata.location();
         match validate_deployment(physical_root, private_root, signoff) {
             Ok(DeploymentStatus::Compliant) => {
@@ -139,10 +144,13 @@ impl IcebergTableManager {
         file_io: &FileIO,
         next_file_id: &mut u64,
     ) -> IcebergResult<Vec<MooncakeFileIndex>> {
-        let Some(private_root) = self.config.private_index_root.as_deref() else {
+        let metadata = self.iceberg_table.as_ref().unwrap().metadata();
+        let Some(private_root) = table_property::get_bound_private_index_root(
+            metadata.properties(),
+            self.config.private_index_root.as_deref(),
+        ) else {
             return Ok(Vec::new());
         };
-        let metadata = self.iceberg_table.as_ref().unwrap().metadata();
         let Some(snapshot) = metadata.current_snapshot() else {
             return Ok(Vec::new());
         };
@@ -153,12 +161,19 @@ impl IcebergTableManager {
             table_uuid,
         );
         // Surface the IO error as an iceberg error so the caller's error path stays uniform.
+        // Permanent moonlink errors (schema/UUID mismatch surfaced by read_snap_manifest)
+        // become DataInvalid — that's the iceberg signal for "retrying will not help";
+        // everything else stays Unexpected so transient IO can still be retried upstream.
         let manifest = store
             .read_snap_manifest(snapshot.snapshot_id())
             .await
             .map_err(|e| {
+                let kind = match e.get_status() {
+                    moonlink_error::ErrorStatus::Permanent => iceberg::ErrorKind::DataInvalid,
+                    _ => iceberg::ErrorKind::Unexpected,
+                };
                 IcebergError::new(
-                    iceberg::ErrorKind::Unexpected,
+                    kind,
                     format!(
                         "read private manifest for snapshot {}",
                         snapshot.snapshot_id()

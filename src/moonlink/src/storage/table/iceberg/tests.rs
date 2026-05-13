@@ -46,6 +46,7 @@ use crate::storage::table::iceberg::iceberg_table_config::IcebergTableConfig;
 use crate::storage::table::iceberg::iceberg_table_manager::IcebergTableManager;
 use crate::storage::table::iceberg::manifest_utils::{self, ManifestEntryType};
 use crate::storage::table::iceberg::schema_utils::*;
+use crate::storage::table::iceberg::table_property::MOONCAKE_PRIVATE_INDEX_ROOT;
 use crate::storage::table::iceberg::test_utils::*;
 use crate::storage::wal::test_utils::WAL_TEST_TABLE_ID;
 use crate::storage::MooncakeTable;
@@ -1369,7 +1370,11 @@ async fn test_hash_index_private_manifest_is_cross_engine_safe() {
         mooncake_table_metadata.clone(),
         create_test_object_storage_cache(&cache_temp_dir),
         filesystem_accessor.clone(),
-        iceberg_table_config.clone(),
+        {
+            let mut config = iceberg_table_config.clone();
+            config.private_index_root = None;
+            config
+        },
     )
     .await
     .unwrap();
@@ -1377,6 +1382,18 @@ async fn test_hash_index_private_manifest_is_cross_engine_safe() {
         .load_snapshot_from_table()
         .await
         .unwrap();
+    let recovered_table = iceberg_table_manager_for_recovery
+        .iceberg_table
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        recovered_table
+            .metadata()
+            .properties()
+            .get(MOONCAKE_PRIVATE_INDEX_ROOT)
+            .map(String::as_str),
+        iceberg_table_config.private_index_root.as_deref(),
+    );
 
     // Cross-engine readers only see Iceberg metadata. Hash-index Puffin blobs used
     // to appear as Data+Puffin manifest entries, which Spark/pyiceberg reject.
@@ -1396,6 +1413,53 @@ async fn test_hash_index_private_manifest_is_cross_engine_safe() {
         filesystem_accessor.as_ref(),
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_private_index_root_inside_table_root_rejected_on_write() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let mut iceberg_table_config = get_iceberg_table_config(&iceberg_temp_dir);
+    iceberg_table_config.private_index_root = Some(format!(
+        "{}/{}/{}/_mooncake_private",
+        iceberg_temp_dir.path().to_str().unwrap(),
+        ICEBERG_TEST_NAMESPACE,
+        ICEBERG_TEST_TABLE
+    ));
+
+    let table_temp_dir = tempdir().unwrap();
+    let mooncake_table_metadata =
+        create_test_table_metadata(table_temp_dir.path().to_str().unwrap().to_string());
+    let cache_temp_dir = tempdir().unwrap();
+    let (mut table, mut notify_rx) = create_mooncake_table_and_notify(
+        mooncake_table_metadata,
+        iceberg_table_config,
+        create_test_object_storage_cache(&cache_temp_dir),
+    )
+    .await;
+
+    table.append(test_row_1()).unwrap();
+    table.commit(/*lsn=*/ 1);
+    flush_table_and_sync(&mut table, &mut notify_rx, /*lsn=*/ 1)
+        .await
+        .unwrap();
+    assert!(table.try_create_mooncake_snapshot(SnapshotOption {
+        uuid: uuid::Uuid::new_v4(),
+        force_create: true,
+        dump_snapshot: false,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::Skip,
+        data_compaction_option: MaintenanceOption::Skip,
+    }));
+    let (_, persistence_snapshot_payload, _, _, _) =
+        sync_mooncake_snapshot(&mut table, &mut notify_rx).await;
+    let err = create_iceberg_snapshot(&mut table, persistence_snapshot_payload, &mut notify_rx)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("mooncake private root deployment rejected"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

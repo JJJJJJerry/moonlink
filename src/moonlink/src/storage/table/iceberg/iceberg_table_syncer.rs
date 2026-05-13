@@ -34,6 +34,7 @@ use crate::storage::table::iceberg::puffin_writer_proxy::{
     get_puffin_metadata_and_close, PuffinBlobMetadata,
 };
 use crate::storage::table::iceberg::schema_utils;
+use crate::storage::table::iceberg::table_property;
 use crate::storage::table::iceberg::utils::get_unique_hash_index_v1_filepath;
 use crate::Result;
 
@@ -742,6 +743,7 @@ impl IcebergTableManager {
 
         // Initialize iceberg table on access.
         self.initialize_iceberg_table_for_once().await?;
+        self.validate_private_root_deployment()?;
 
         // Validate schema consistency before persistence operation.
         self.validate_schema_consistency_at_store().await;
@@ -866,11 +868,14 @@ impl IcebergTableManager {
         &self,
         file_index_blobs: HashMap<String, Vec<PuffinBlobMetadata>>,
     ) -> Result<()> {
-        let Some(private_root) = self.config.private_index_root.as_deref() else {
+        let metadata = self.iceberg_table.as_ref().unwrap().metadata();
+        let Some(private_root) = table_property::get_bound_private_index_root(
+            metadata.properties(),
+            self.config.private_index_root.as_deref(),
+        ) else {
             return Ok(());
         };
 
-        let metadata = self.iceberg_table.as_ref().unwrap().metadata();
         let current_snapshot = match metadata.current_snapshot() {
             Some(snap) => snap,
             // No snapshot means there's nothing to anchor against — skip; the next
