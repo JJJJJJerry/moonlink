@@ -1,10 +1,10 @@
-// B-5c wired `record` / `begin_commit` / `Marker::new_create` to real callers in
-// `iceberg_table_syncer::persist_private_manifest`. The remaining APIs
-// (`commit_success`, `rollback`, `scan_hanging`, `read_markers`, `HangingCommit`,
+// Pre-write `record` / `begin_commit` and the post-commit `commit_success` now
+// have real callers in `iceberg_table_syncer::persist_private_manifest`. The
+// remaining APIs (`rollback`, `scan_hanging`, `read_markers`, `HangingCommit`,
 // `with_commit_lsn`, `parse_suffix`, `is_marker_file`, `parse_snapshot_dirname`)
-// land their first non-test callers in B-5d / B-5e / B-5g. Keep the module-level
-// allow until those sub-tasks ship — flipping the lint per-item now would just
-// require flipping it back later. Remove this attribute when B-5g lands.
+// land their first non-test callers in the boot reconciliation and audit
+// paths still to ship. Keep the module-level allow until those land — flipping
+// the lint per-item now would just require flipping it back later.
 #![allow(dead_code)]
 
 //! Hudi-pattern marker file primitives for the mooncake private root.

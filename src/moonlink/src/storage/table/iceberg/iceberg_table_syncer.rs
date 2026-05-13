@@ -840,13 +840,22 @@ impl IcebergTableManager {
         self.iceberg_table = Some(updated_iceberg_table);
 
         // Persist hash-index puffin pointers to the mooncake-private manifest
-        // (Mode 2a). Drain catalog state only after persistence succeeds —
-        // otherwise transient marker / write_snap_manifest failures would erase
-        // the new blob metadata and the next retry would silently emit a manifest
-        // missing those entries (parent inheritance only carries forward blobs
-        // already in a prior successful manifest).
+        // (Mode 2a).
         //
-        // Invariant gap, unclosed by this layer: markers below are keyed by the
+        // INVARIANT — peek before persist, drain only on success. If you refactor
+        // this block, preserve the three-step shape:
+        //   1. `peek_file_index_blobs_to_add` — borrow the blob metadata.
+        //   2. `persist_private_manifest(...)?` — fallible; markers + manifest.
+        //   3. `take_file_index_blobs_to_add` + `clear_puffin_metadata` — only
+        //      reached on success, so a transient marker / manifest IO failure
+        //      leaves the blob set in the catalog for the next attempt.
+        // Draining first (the obvious-looking refactor) loses the new blob set
+        // on transient failure: the parent-inheritance loop in
+        // `persist_private_manifest` only carries forward blobs **already** in
+        // a prior successful manifest, so an unrecovered drained set ends up
+        // missing from every future manifest.
+        //
+        // INVARIANT GAP, unclosed by this layer: markers below are keyed by the
         // Iceberg snapshot_id returned by `txn.commit`, so a crash between commit
         // return and the first marker write leaves a live Iceberg snapshot with
         // no marker dir and no private manifest. `scan_hanging` cannot detect
@@ -958,9 +967,13 @@ impl IcebergTableManager {
             .await?;
 
         store.write_snap_manifest(&manifest).await?;
-        // B-5d (commit-success cleanup) will land here in the next sub-task; until
-        // then markers persist and are reaped by the boot rollback path (B-5e) only
-        // when their snapshot is no longer live.
+
+        // Sweep the marker dir now that both txn.commit and write_snap_manifest
+        // have succeeded — at this point Iceberg's live set and the private
+        // manifest both anchor this snapshot, so the markers no longer carry
+        // recovery information. Failure to reach here leaves the dir behind for
+        // the boot reconciliation path to reap.
+        marker_dir.commit_success(snapshot_id).await?;
         Ok(())
     }
 }
