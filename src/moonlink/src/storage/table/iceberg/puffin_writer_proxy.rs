@@ -172,7 +172,15 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
             continue;
         }
 
-        // Check for file index entries, see if there're updates.
+        // TODO(Jerry) B-1 legacy: this `ManifestEntryType::FileIndex` early-return is
+        // dead code in greenfield deployments — post-B-1 hash blobs never enter the
+        // Iceberg manifest_list (they go to PrivateManifestStore). The branch is kept
+        // **only** to handle pre-B-1 tables that still carry Data+Puffin entries in
+        // their manifest_list, so a subsequent commit can copy those entries forward
+        // (no rewrite) or expire them. Delete together with the matching arm in the
+        // `match manifest_entry_type` below and the `FileIndex` finalize() call once
+        // we are certain no pre-B-1 table exists (telemetry-driven; see Phase E in
+        // hash_index_refactor/ROADMAP.md).
         if manifest_entry_type == ManifestEntryType::FileIndex
             && file_index_blobs_to_add.is_empty()
             && index_puffin_blobs_to_remove.is_empty()
@@ -191,6 +199,9 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
                 deletion_vector_manifest_manager
                     .add_manifest_entries(manifest_entries, manifest_metadata)?;
             }
+            // TODO(Jerry) B-1 legacy: post-B-1 commits never produce new FileIndex
+            // manifest entries; this arm only fires when ingesting a manifest_list
+            // inherited from a pre-B-1 table. Remove once pre-B-1 tables are extinct.
             ManifestEntryType::FileIndex => {
                 file_index_manifest_manager
                     .add_manifest_entries(manifest_entries, manifest_metadata)?;
@@ -203,9 +214,21 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
     // DM(Jerry) B-1: hash-index puffin blobs are no longer registered into the Iceberg
     // standard manifest_list — that entry shape (Data + Puffin) is out-of-spec and breaks
     // Spark / pyiceberg readers. New hash blobs flow to Mode 2a PrivateManifestStore in B-2.
-    // The legacy ManifestEntryType::FileIndex pruning path above is retained so existing
-    // tables (created pre-B-1) can still expire their old file-index manifest entries.
-    let _ = file_index_blobs_to_add; // routed to private manifest in B-commit-integration
+    //
+    // TODO(Jerry) B-1 legacy retention rationale (kept, not deleted, on purpose):
+    // - `file_index_blobs_to_add` and `index_puffin_blobs_to_remove` parameters are still
+    //   on the signature for ABI stability with the upstream `pg_mooncake` callers and
+    //   to keep the diff against upstream `moonlink` small while Phase B stabilizes.
+    // - The `ManifestEntryType::FileIndex` branches above (early-return + manager fan-out
+    //   + finalize) are dead code in greenfield deployments but required to migrate any
+    //   pre-B-1 table whose manifest_list still carries Data+Puffin entries.
+    // - Greenfield-only environments (no pre-B-1 tables, no upstream-shape callers) may
+    //   delete these branches together with `FileIndexManifestManager`, the `FileIndex`
+    //   enum variant, and these two parameters. Gate the deletion on: (a) zero hits in
+    //   the FileIndex branch counter (telemetry to be added in Phase E), and (b) explicit
+    //   confirmation that the public moonlink API does not need to keep accepting these
+    //   parameters for downstream forks.
+    let _ = file_index_blobs_to_add; // routed to PrivateManifestStore by iceberg_table_syncer post-commit
 
     // Attempt to finalize all existing manifest entries.
     if let Some(manifest_file) = data_file_manifest_manager.finalize().await? {
@@ -214,6 +237,10 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
     if let Some(manifest_file) = deletion_vector_manifest_manager.finalize().await? {
         manifest_list_writer.add_manifests(std::iter::once(manifest_file))?;
     }
+    // TODO(Jerry) B-1 legacy: finalize() is a no-op for greenfield tables (the manager
+    // never received any entries because new hash blobs bypass this path). Retained to
+    // cover the pre-B-1 migration case described above. Remove together with the two
+    // FileIndex branches in the loop once Phase E telemetry confirms zero hits.
     if let Some(manifest_file) = file_index_manifest_manager.finalize().await? {
         manifest_list_writer.add_manifests(std::iter::once(manifest_file))?;
     }

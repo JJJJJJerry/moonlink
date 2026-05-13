@@ -101,6 +101,13 @@ impl PrivateManifestStore {
         format!("{}/snap-{}.json", self.manifest_dir(), iceberg_snapshot_id)
     }
 
+    /// Public accessor used by the marker pre-write hook (B-5c) to record the
+    /// planned manifest write before it happens. Mirrors `manifest_path` so
+    /// markers and the actual writer never disagree on the target URI.
+    pub(crate) fn manifest_path_for(&self, iceberg_snapshot_id: i64) -> String {
+        self.manifest_path(iceberg_snapshot_id)
+    }
+
     /// Persist a manifest for the given Iceberg snapshot. Overwrites any prior file
     /// at the same path — callers are expected to invoke this once per successful
     /// Iceberg snapshot commit, so collisions imply a retry of the same commit_lsn.

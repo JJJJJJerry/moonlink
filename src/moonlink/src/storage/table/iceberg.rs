@@ -19,6 +19,7 @@ pub(crate) mod moonlink_catalog;
 pub(crate) mod parquet_metadata_utils;
 pub(crate) mod parquet_stats_utils;
 pub(crate) mod parquet_utils;
+pub(crate) mod marker;
 pub(crate) mod private_manifest;
 pub(crate) mod puffin_utils;
 pub(crate) mod puffin_writer_proxy;

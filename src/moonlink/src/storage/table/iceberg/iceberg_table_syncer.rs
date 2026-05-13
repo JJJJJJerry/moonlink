@@ -24,6 +24,7 @@ use crate::storage::table::iceberg::iceberg_table_manager::*;
 use crate::storage::table::iceberg::index::FileIndexBlob;
 use crate::storage::table::iceberg::index::MOONCAKE_HASH_INDEX_V1_CARDINALITY;
 use crate::storage::table::iceberg::io_utils as iceberg_io_utils;
+use crate::storage::table::iceberg::marker::{Marker, MoonlinkMarkerDir};
 use crate::storage::table::iceberg::moonlink_catalog::PuffinBlobType;
 use crate::storage::table::iceberg::private_manifest::{
     HashIndexEntry, PrivateManifest, PrivateManifestStore,
@@ -838,12 +839,22 @@ impl IcebergTableManager {
         };
         self.iceberg_table = Some(updated_iceberg_table);
 
-        // Phase B (B-commit-integration): persist hash-index puffin pointers to the
-        // mooncake-private manifest (Mode 2a). Drain *before* `clear_puffin_metadata`
-        // so the blobs aren't lost; deletion-vector / removal sets are cleared as before.
-        let file_index_blobs = self.catalog.take_file_index_blobs_to_add();
-        self.persist_private_manifest(file_index_blobs).await?;
-
+        // Persist hash-index puffin pointers to the mooncake-private manifest
+        // (Mode 2a). Drain catalog state only after persistence succeeds —
+        // otherwise transient marker / write_snap_manifest failures would erase
+        // the new blob metadata and the next retry would silently emit a manifest
+        // missing those entries (parent inheritance only carries forward blobs
+        // already in a prior successful manifest).
+        //
+        // Invariant gap, unclosed by this layer: markers below are keyed by the
+        // Iceberg snapshot_id returned by `txn.commit`, so a crash between commit
+        // return and the first marker write leaves a live Iceberg snapshot with
+        // no marker dir and no private manifest. `scan_hanging` cannot detect
+        // this; reconciliation must probe live snapshots for a missing
+        // `snap-<id>.json`. See `09_b1_b2_private_manifest_walkthrough.md` §5 R1.
+        self.persist_private_manifest(self.catalog.peek_file_index_blobs_to_add())
+            .await?;
+        let _ = self.catalog.take_file_index_blobs_to_add();
         self.catalog.clear_puffin_metadata();
 
         // NOTICE: persisted data files and file indices are returned in the order of (1) newly imported ones; (2) index merge ones; (3) data compacted ones.
@@ -866,7 +877,7 @@ impl IcebergTableManager {
     /// private roots require a separate accessor and are deferred.
     async fn persist_private_manifest(
         &self,
-        file_index_blobs: HashMap<String, Vec<PuffinBlobMetadata>>,
+        file_index_blobs: &HashMap<String, Vec<PuffinBlobMetadata>>,
     ) -> Result<()> {
         let metadata = self.iceberg_table.as_ref().unwrap().metadata();
         let Some(private_root) = table_property::get_bound_private_index_root(
@@ -903,7 +914,7 @@ impl IcebergTableManager {
             }
         }
 
-        for (puffin_file_path, blobs) in file_index_blobs.into_iter() {
+        for (puffin_file_path, blobs) in file_index_blobs.iter() {
             for blob in blobs.iter() {
                 let cardinality = blob
                     .properties()
@@ -921,7 +932,35 @@ impl IcebergTableManager {
         }
 
         let manifest = PrivateManifest::new(snapshot_id, table_uuid, entries);
+
+        // Lay one marker per artifact this commit will materialize on the private
+        // root: each newly added puffin file and the snap-<id>.json itself. Only
+        // *new* puffin files are marked; parent-inherited entries are already
+        // anchored by the prior commit's manifest. Markers must be durable before
+        // `write_snap_manifest` runs so a crash in between leaves a recoverable
+        // trail for the boot reconciliation path.
+        let marker_dir = MoonlinkMarkerDir::new(
+            self.filesystem_accessor.clone(),
+            private_root.to_string(),
+            table_uuid,
+        );
+        let commit_markers = marker_dir.begin_commit(snapshot_id);
+        for puffin_file_path in file_index_blobs.keys() {
+            commit_markers
+                .record(Marker::new_create(snapshot_id, puffin_file_path.clone()))
+                .await?;
+        }
+        commit_markers
+            .record(Marker::new_create(
+                snapshot_id,
+                store.manifest_path_for(snapshot_id),
+            ))
+            .await?;
+
         store.write_snap_manifest(&manifest).await?;
+        // B-5d (commit-success cleanup) will land here in the next sub-task; until
+        // then markers persist and are reaped by the boot rollback path (B-5e) only
+        // when their snapshot is no longer live.
         Ok(())
     }
 }

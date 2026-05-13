@@ -260,11 +260,12 @@ impl PuffinWrite for FileCatalog {
         self.table_update_proxy.clear();
     }
 
-    fn take_file_index_blobs_to_add(
-        &mut self,
-    ) -> HashMap<String, Vec<crate::storage::table::iceberg::puffin_writer_proxy::PuffinBlobMetadata>>
-    {
+    fn take_file_index_blobs_to_add(&mut self) -> HashMap<String, Vec<PuffinBlobMetadata>> {
         std::mem::take(&mut self.table_update_proxy.file_index_blobs_to_add)
+    }
+
+    fn peek_file_index_blobs_to_add(&self) -> &HashMap<String, Vec<PuffinBlobMetadata>> {
+        &self.table_update_proxy.file_index_blobs_to_add
     }
 }
 

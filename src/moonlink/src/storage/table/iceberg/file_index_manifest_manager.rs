@@ -8,6 +8,11 @@ use iceberg::io::FileIO;
 use iceberg::spec::{ManifestEntry, ManifestFile, ManifestMetadata, ManifestWriter, TableMetadata};
 use iceberg::Result as IcebergResult;
 
+// TODO(Jerry) B-1 legacy: kept only to migrate pre-B-1 tables forward.
+// `add_manifest_entries` is invoked solely from the pre-B-1 branch in puffin_writer_proxy.rs;
+// new hash blobs go through PrivateManifestStore post-B-1. Remove once all pre-B-1 tables
+// have been migrated. See hash_index_refactor/09_b1_audit_and_legacy_inventory.md.
+#[allow(dead_code)]
 pub(crate) struct FileIndexManifestManager<'a> {
     table_metadata: &'a TableMetadata,
     file_io: &'a FileIO,
@@ -15,6 +20,8 @@ pub(crate) struct FileIndexManifestManager<'a> {
     writer: Option<ManifestWriter>,
 }
 
+// DM(Jerry) B-1 legacy: see the TODO on the struct above for the removal condition.
+#[allow(dead_code)]
 impl<'a> FileIndexManifestManager<'a> {
     pub(crate) fn new(
         table_metadata: &'a TableMetadata,

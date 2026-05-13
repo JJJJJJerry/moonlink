@@ -39,7 +39,20 @@ pub trait PuffinWrite {
     /// `manifest_list` (B-1); the syncer drains them here right after `txn.commit`
     /// and persists them to a mooncake-private manifest (Mode 2a). Calling this
     /// leaves the deletion-vector / removal sets intact for `clear_puffin_metadata`.
+    ///
+    /// Callers must only drain **after** the private manifest write has succeeded,
+    /// otherwise the blob metadata is lost and a retry will silently emit a manifest
+    /// missing the new entries. Use `peek_file_index_blobs_to_add` while the persist
+    /// path is still fallible.
     fn take_file_index_blobs_to_add(&mut self) -> HashMap<String, Vec<PuffinBlobMetadata>>;
+
+    /// Borrow the file-index puffin blob metadata without draining it.
+    ///
+    /// Lets the syncer attempt the private manifest write while leaving the catalog
+    /// state intact, so any transient failure (marker IO, write_snap_manifest) can
+    /// be retried by the next commit instead of producing a manifest missing the
+    /// blobs that this commit introduced.
+    fn peek_file_index_blobs_to_add(&self) -> &HashMap<String, Vec<PuffinBlobMetadata>>;
 }
 
 /// TODO(hjiang): iceberg-rust currently doesn't support schema evolution, to workaround and reduce code change,
