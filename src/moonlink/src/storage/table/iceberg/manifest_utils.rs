@@ -17,12 +17,14 @@ pub(crate) struct PuffinBlobRef<'a> {
     pub content_size_in_bytes: i64,
 }
 
-/// Build a [`DataFile`] manifest entry for one puffin blob (deletion vector or hash index).
+/// Build a [`DataFile`] manifest entry for one puffin blob (deletion vector
+/// or hash index).
 ///
-/// DM(Jerry): centralizes the shared puffin-to-manifest mapping that was previously copy-pasted
-/// across `deletion_vector_manifest_manager` and `file_index_manifest_manager`. `record_count` is
-/// read from the blob property keyed by `cardinality_property`. `file_size_in_bytes` is kept as the
-/// legacy `0` placeholder (not actually consumed for puffin entries; matches upstream behavior).
+/// Centralizes the shared puffin-to-manifest mapping that the deletion-
+/// vector and file-index managers both consume. `record_count` is read from
+/// the blob property keyed by `cardinality_property`. `file_size_in_bytes`
+/// is kept at the legacy `0` placeholder; it is not consumed for puffin
+/// entries and matches the upstream encoding.
 pub(crate) fn build_puffin_data_file(
     puffin_filepath: &str,
     blob_metadata: &BlobMetadata,
@@ -118,10 +120,10 @@ pub(crate) fn create_manifest_writer_builder(
     Ok(manifest_writer_builder)
 }
 
-/// Finalize a builder into a data-content manifest writer matching the table's format version.
-///
-/// DM(Jerry): centralized here so adding a future FormatVersion fails to compile in one place
-/// instead of leaving silent V2-downgrade bugs scattered across managers.
+/// Finalize a builder into a data-content manifest writer matching the
+/// table's format version. Centralized so that adding a future
+/// `FormatVersion` becomes a compile error in one place rather than a
+/// silent V2-downgrade scattered across managers.
 pub(crate) fn build_data_manifest_writer(
     builder: ManifestWriterBuilder,
     format_version: FormatVersion,

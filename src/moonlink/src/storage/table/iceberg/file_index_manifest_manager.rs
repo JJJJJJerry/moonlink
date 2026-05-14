@@ -8,10 +8,11 @@ use iceberg::io::FileIO;
 use iceberg::spec::{ManifestEntry, ManifestFile, ManifestMetadata, ManifestWriter, TableMetadata};
 use iceberg::Result as IcebergResult;
 
-// TODO(Jerry) B-1 legacy: kept only to migrate pre-B-1 tables forward.
-// `add_manifest_entries` is invoked solely from the pre-B-1 branch in puffin_writer_proxy.rs;
-// new hash blobs go through PrivateManifestStore post-B-1. Remove once all pre-B-1 tables
-// have been migrated. See hash_index_refactor/09_b1_audit_and_legacy_inventory.md.
+// Legacy manifest-list hash-index compatibility path. Tables that still carry
+// hash-index entries inside the Iceberg manifest list go through this writer
+// during recovery; new hash blobs flow to `PrivateManifestStore` instead. The
+// writer can be removed once telemetry confirms there are no remaining
+// tables emitting such entries.
 #[allow(dead_code)]
 pub(crate) struct FileIndexManifestManager<'a> {
     table_metadata: &'a TableMetadata,
@@ -20,7 +21,6 @@ pub(crate) struct FileIndexManifestManager<'a> {
     writer: Option<ManifestWriter>,
 }
 
-// DM(Jerry) B-1 legacy: see the TODO on the struct above for the removal condition.
 #[allow(dead_code)]
 impl<'a> FileIndexManifestManager<'a> {
     pub(crate) fn new(
@@ -42,8 +42,9 @@ impl<'a> FileIndexManifestManager<'a> {
         }
         let new_writer_builder =
             manifest_utils::create_manifest_writer_builder(self.table_metadata, self.file_io)?;
-        // DM(Jerry): file-index manifest is content=Data + file_format=Puffin (mooncake's
-        // own convention); it follows the same V1/V2/V3 dispatch as data-file manifests.
+        // The file-index manifest used content=Data + file_format=Puffin
+        // (mooncake's own convention) and follows the same V1/V2/V3 dispatch
+        // as data-file manifests.
         let new_writer = manifest_utils::build_data_manifest_writer(
             new_writer_builder,
             self.table_metadata.format_version(),
@@ -82,9 +83,9 @@ impl<'a> FileIndexManifestManager<'a> {
 
     /// Finalize the current manifest file and return.
     ///
-    /// DM(Jerry) B-1: only emits a manifest file when legacy `add_manifest_entries` was
-    /// invoked (existing file-index entries surviving the prune filter). Fresh hash blobs
-    /// no longer enter the Iceberg manifest chain — they flow to PrivateManifestStore.
+    /// Only emits a manifest file when `add_manifest_entries` was invoked
+    /// (i.e. legacy file-index entries survived the prune filter). Fresh hash
+    /// blobs flow to `PrivateManifestStore` instead.
     pub(crate) async fn finalize(self) -> IcebergResult<Option<ManifestFile>> {
         if let Some(writer) = self.writer {
             let manifest_file = writer.write_manifest_file().await?;

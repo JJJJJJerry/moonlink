@@ -35,10 +35,10 @@ pub trait PuffinWrite {
 
     /// Move out file-index puffin blob metadata recorded for the current transaction.
     ///
-    /// Phase B (B-commit-integration): hash-index blobs no longer enter the Iceberg
-    /// `manifest_list` (B-1); the syncer drains them here right after `txn.commit`
-    /// and persists them to a mooncake-private manifest (Mode 2a). Calling this
-    /// leaves the deletion-vector / removal sets intact for `clear_puffin_metadata`.
+    /// Hash-index blobs do not enter the Iceberg `manifest_list`; the syncer
+    /// drains them here right after `txn.commit` and persists them to the
+    /// mooncake-private manifest. Calling this leaves the deletion-vector /
+    /// removal sets intact for `clear_puffin_metadata`.
     ///
     /// Callers must only drain **after** the private manifest write has succeeded,
     /// otherwise the blob metadata is lost and a retry will silently emit a manifest

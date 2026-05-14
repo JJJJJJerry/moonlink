@@ -24,13 +24,14 @@ pub(crate) const TABLE_COMMIT_RETRY_TIMEOUT_MS: &str = "commit.retry.total-timeo
 pub(crate) const TABLE_COMMIT_RETRY_TIMEOUT_MS_DEFAULT: u64 = 120000; // 2 min
 
 // ---------------------------------------------------------------------------
-// mooncake.* properties (Phase B Mode 2a binding)
+// mooncake private hash-index properties
 //
-// These keys live in the standard Iceberg `metadata.properties` map. Cross-engine
-// readers (Spark, pyiceberg, Trino) ignore unknown property keys — see Iceberg
-// spec §"Table Properties" — so emitting them here is safe.
-// `mooncake.private_index_root` is the *base* root only; per-table state lives at
-// `<root>/<iceberg_table_uuid>/`, with the UUID read from `metadata.table-uuid`.
+// These keys live in the standard Iceberg `metadata.properties` map. Cross-
+// engine readers (Spark, pyiceberg, Trino) ignore unknown property keys
+// (Iceberg spec §"Table Properties"), so emitting them is safe.
+// `mooncake.private_index_root` is the *base* root only; per-table state
+// lives at `<root>/<iceberg_table_uuid>/`, with the UUID read from
+// `metadata.table-uuid`.
 // ---------------------------------------------------------------------------
 
 pub(crate) const MOONCAKE_PRIVATE_INDEX_ROOT: &str = "mooncake.private_index_root";
@@ -60,9 +61,9 @@ pub(crate) fn get_bound_private_index_root<'a>(
 
 // Create iceberg table properties.
 //
-// `private_index_root` — when `Some`, emits the `mooncake.*` binding so future
-// bgworker boots can locate the private manifest directory (B-3 / B-commit-integration).
-// `None` keeps legacy tables free of mooncake metadata.
+// `private_index_root` — when `Some`, emits the `mooncake.*` binding so later
+// table loads can locate the private manifest directory. `None` keeps the
+// table free of mooncake-specific metadata.
 pub(crate) fn create_iceberg_table_properties(
     private_index_root: Option<&str>,
 ) -> HashMap<String, String> {

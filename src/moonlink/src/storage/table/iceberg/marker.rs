@@ -1,43 +1,46 @@
-// Pre-write `record` / `begin_commit` and the post-commit `commit_success` now
-// have real callers in `iceberg_table_syncer::persist_private_manifest`. The
-// remaining APIs (`rollback`, `scan_hanging`, `read_markers`, `HangingCommit`,
-// `with_commit_lsn`, `parse_suffix`, `is_marker_file`, `parse_snapshot_dirname`)
-// land their first non-test callers in the boot reconciliation and audit
-// paths still to ship. Keep the module-level allow until those land — flipping
-// the lint per-item now would just require flipping it back later.
+// Some helper APIs (`with_commit_lsn`, `parse_suffix`, `is_marker_file`,
+// `parse_snapshot_dirname`) and the marker-side failure paths for
+// `MoonlinkMarkerDir::commit_success` are not yet exercised by production
+// callers. They underpin the retention/audit sweeper that will follow; keep a
+// module-level allow until that path lands rather than flip per-item lints
+// back and forth.
 #![allow(dead_code)]
 
-//! Hudi-pattern marker file primitives for the mooncake private root.
+//! Marker file primitives for the mooncake private root.
 //!
-//! Purpose: provide recoverability for the non-atomic window between
-//! `Iceberg txn.commit` Ok and `PrivateManifestStore::write_snap_manifest` Ok
-//! (see `AI_DOCs/iceberg_index_proposal/hash_index_refactor/09_b1_b2_private_manifest_walkthrough.md`
-//! §5 R1). Before mooncake writes the per-snapshot private manifest, the syncer
-//! lays down one marker file per artifact under
+//! The marker directory provides recoverability for the non-atomic window
+//! between an Iceberg `txn.commit` Ok and the matching `PrivateManifestStore::write_snap_manifest`
+//! Ok. Before the syncer writes a per-snapshot private manifest, it lays down
+//! one marker file per artifact under:
 //!
 //! ```text
 //! <private_root>/<table_uuid>/.markers/<snapshot_id>/<artifact_uuid>.marker.<op>
 //! ```
 //!
-//! After the Iceberg snapshot commits AND the private manifest is durably written,
-//! `commit_success(snapshot_id)` deletes the whole `.markers/<snapshot_id>/` directory
-//! (B-5d). On bgworker boot, `scan_hanging` lists marker directories whose
-//! `<snapshot_id>` is not present in the live Iceberg snapshot set — those are
-//! inflight writes interrupted by a crash and the staging files they reference are
-//! rolled back (B-5e).
+//! Lifecycle:
 //!
-//! Implemented sub-tasks:
-//! - B-5a: `MarkerOp`, `Marker`, `CommitMarkers` data shapes.
-//! - B-5b: `MoonlinkMarkerDir` with `begin_commit / commit_success / rollback /
-//!   scan_hanging / read_markers`.
-//! - B-5c: pre-write hook from `iceberg_table_syncer::persist_private_manifest`.
-//!
-//! Out of scope (later sub-tasks): commit-success wiring (B-5d), boot rollback scan
-//! (B-5e), heartbeat / fencing (B-5f), retention / dry-run / audit (B-5g).
+//! * **Recording** (post-Iceberg-commit, pre-private-manifest): the syncer
+//!   writes marker files only after `txn.commit` succeeds and before
+//!   `write_snap_manifest`. Hash-index puffins are physically written
+//!   *earlier* in the commit pipeline; their markers therefore guard the
+//!   "commit landed but private manifest may not have" window, not the
+//!   earlier "puffin written but not yet committed" window. Stragglers from
+//!   the earlier window are cleaned up by Iceberg's own orphan-file
+//!   tooling, not by this marker directory.
+//! * **Post-private-manifest cleanup**: once both the Iceberg commit and
+//!   the private manifest are durable, `commit_success(snapshot_id)`
+//!   removes the `.markers/<snapshot_id>/` directory.
+//! * **Load-time orphan reconciliation**: a table load lists marker dirs
+//!   whose snapshot is no longer live and dispatches the witnessed
+//!   artifacts — staging files from failed commits are deleted, while
+//!   artifacts still referenced by a live snapshot's private manifest are
+//!   skipped.
+//! * **Retention sweeper** (not yet implemented): aged marker dirs are
+//!   pruned under operator-controlled retention.
 //!
 //! Reference: Apache Hudi `WriteMarkers` / `MarkerFiles.deleteMarkerDir()` /
-//! `IOType` (we keep `Create` and `Replace`, dropping `MoR`-specific arms because
-//! mooncake is copy-on-write).
+//! `IOType` informed the on-disk layout. Mooncake keeps `Create` and `Replace`
+//! and drops `MoR`-specific arms because the storage path is copy-on-write.
 
 use crate::storage::filesystem::accessor::base_filesystem_accessor::BaseFileSystemAccess;
 use crate::{Error, Result};
@@ -139,8 +142,11 @@ impl CommitMarkers<'_> {
         self.snapshot_id
     }
 
-    /// Lay down a single marker for `file_path`. Called by every artifact writer
-    /// (private manifest / puffin) *before* the actual data write.
+    /// Lay down a single marker for `file_path`. Called after the Iceberg
+    /// `txn.commit` succeeds and before `PrivateManifestStore::write_snap_manifest`,
+    /// so the marker witnesses the post-commit private-manifest window —
+    /// not the earlier puffin write (which happens before `txn.commit`).
+    /// See the module-level doc for the full lifecycle.
     pub(crate) async fn record(&self, marker: Marker) -> Result<()> {
         if marker.snapshot_id != self.snapshot_id {
             return Err(Error::IcebergError(ErrorStruct::new(
@@ -158,10 +164,10 @@ impl CommitMarkers<'_> {
     }
 }
 
-/// One Iceberg snapshot worth of markers that survived a crash. The caller
-/// (boot rollback path, B-5e) is responsible for re-reading each marker file
-/// referenced by `file_paths_to_delete` (full list available via
-/// `MoonlinkMarkerDir::read_markers`) and deleting the staging artifacts.
+/// One Iceberg snapshot worth of markers that survived a crash. The load-time
+/// reconciliation path re-reads each marker file via
+/// `MoonlinkMarkerDir::read_markers` and dispatches the staging artifacts the
+/// markers witness.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HangingCommit {
     pub snapshot_id: i64,
@@ -235,18 +241,19 @@ impl MoonlinkMarkerDir {
         self.purge_snapshot_dir(snapshot_id).await
     }
 
-    /// Same on-disk effect as `commit_success`, but expresses intent ("this commit
-    /// was aborted") for telemetry / audit hooks added in B-5g.
+    /// Same on-disk effect as `commit_success`, but expresses intent ("this
+    /// commit was aborted") so future audit/telemetry hooks can distinguish
+    /// success-driven cleanup from rollback-driven cleanup.
     pub(crate) async fn rollback(&self, snapshot_id: i64) -> Result<()> {
         self.purge_snapshot_dir(snapshot_id).await
     }
 
-    /// Read every marker payload for `snapshot_id`. Used by the rollback path
-    /// (B-5e) to discover which staging files need to be removed before the
-    /// marker dir itself is purged.
+    /// Read every marker payload for `snapshot_id`. The reconciliation path
+    /// uses this to discover which staging files need to be dispatched before
+    /// the marker dir itself is purged.
     ///
-    /// P2 (degradation policy): per-file errors /
-    /// schema mismatches surface as `Err` — B-5e will quarantine.
+    /// Per-file errors / schema mismatches surface as `Err`; the caller
+    /// quarantines them rather than rolling back blindly.
     pub(crate) async fn read_markers(&self, snapshot_id: i64) -> Result<Vec<Marker>> {
         let dir = self.snapshot_dir(snapshot_id);
         // `list_direct_files` returns basenames relative to `dir`; re-anchor before
@@ -317,8 +324,8 @@ impl MoonlinkMarkerDir {
         // don't have empty prefixes, but we write to the strictest backend.
         //
         // `remove_directory` is recursive, which is what we want: any stray
-        // non-marker file under `<snapshot_id>/` (e.g. an artifact a future B-5c
-        // hook stages there before laying down its marker) should also be reaped.
+        // non-marker file under `<snapshot_id>/` (e.g. an artifact a writer
+        // stages there before laying down its marker) should also be reaped.
         self.fs.remove_directory(&dir).await?;
         Ok(())
     }

@@ -61,8 +61,9 @@ async fn create_new_manifest_list_writer(
     let latest_seq_no = table_metadata.last_sequence_number();
     let snapshot_id = cur_snapshot.snapshot_id();
 
-    // DM(Jerry): match (not if/else) so a future FormatVersion::V4 fails to compile here
-    // instead of silently downgrading the manifest-list header.
+    // Use `match` rather than `if/else` so a future `FormatVersion::V4`
+    // becomes a compile-time error here, rather than silently downgrading
+    // the manifest-list header.
     let manifest_list_writer = match table_metadata.format_version() {
         FormatVersion::V1 => ManifestListWriter::v1(
             manifest_list_outfile,
@@ -75,9 +76,9 @@ async fn create_new_manifest_list_writer(
             /*parent_snapshot_id=*/ None,
             latest_seq_no,
         ),
-        // TODO(Jerry): once row-lineage is enabled, plumb the real starting row id from
-        // cur_snapshot.first_row_id(). Passing None for now is enough to emit a valid V3
-        // manifest-list header (format-version=3, first-row-id=null).
+        // TODO: once row-lineage is enabled, plumb the real starting row id
+        // from `cur_snapshot.first_row_id()`. Passing `None` for now emits a
+        // valid V3 manifest-list header (format-version=3, first-row-id=null).
         FormatVersion::V3 => ManifestListWriter::v3(
             manifest_list_outfile,
             snapshot_id,
@@ -103,6 +104,13 @@ async fn create_new_manifest_list_writer(
 /// * data_files_to_remove: remote data file path, if non empty, both data file and deletion vector manifest entries should be updated.
 /// * index_puffin_blobs_to_remove: remote file index puffin file path, if non empty, file index manifest entries should be updated.
 ///
+/// Note: `file_index_blobs_to_add` is accepted for ABI parity with the
+/// catalog commit path but does not on its own trigger a manifest-list
+/// rewrite. New hash-index puffin blobs flow to `PrivateManifestStore`
+/// instead, so the only reasons to touch the Iceberg manifest list are
+/// data-file removal, deletion-vector additions, or legacy hash-index
+/// removal.
+///
 /// TODO(hjiang):
 /// 1. There're too many sequential IO operations to rewrite deletion vectors, need to optimize.
 /// 2. Could optimize to avoid file indices manifest file to rewrite.
@@ -116,9 +124,12 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
 ) -> IcebergResult<()> {
     if data_files_to_remove.is_empty()
         && deletion_vector_blobs_to_add.is_empty()
-        && file_index_blobs_to_add.is_empty()
         && index_puffin_blobs_to_remove.is_empty()
     {
+        // `file_index_blobs_to_add` non-empty alone never produces work
+        // here — it is consumed via `PrivateManifestStore` after the
+        // catalog commit. Skipping the manifest-list rewrite avoids
+        // pointless metadata IO and shrinks the failure surface.
         return Ok(());
     }
 
@@ -172,15 +183,12 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
             continue;
         }
 
-        // TODO(Jerry) B-1 legacy: this `ManifestEntryType::FileIndex` early-return is
-        // dead code in greenfield deployments — post-B-1 hash blobs never enter the
-        // Iceberg manifest_list (they go to PrivateManifestStore). The branch is kept
-        // **only** to handle pre-B-1 tables that still carry Data+Puffin entries in
-        // their manifest_list, so a subsequent commit can copy those entries forward
-        // (no rewrite) or expire them. Delete together with the matching arm in the
-        // `match manifest_entry_type` below and the `FileIndex` finalize() call once
-        // we are certain no pre-B-1 table exists (telemetry-driven; see Phase E in
-        // hash_index_refactor/ROADMAP.md).
+        // Legacy manifest-list hash-index compatibility: new hash blobs are
+        // written to `PrivateManifestStore` instead, so the only reason to
+        // touch a `FileIndex` manifest is to copy forward existing entries
+        // inherited from a table that still carries Data+Puffin shapes in its
+        // manifest list. When the current commit has nothing to add or remove
+        // for this category, pass the manifest through unchanged.
         if manifest_entry_type == ManifestEntryType::FileIndex
             && file_index_blobs_to_add.is_empty()
             && index_puffin_blobs_to_remove.is_empty()
@@ -199,9 +207,9 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
                 deletion_vector_manifest_manager
                     .add_manifest_entries(manifest_entries, manifest_metadata)?;
             }
-            // TODO(Jerry) B-1 legacy: post-B-1 commits never produce new FileIndex
-            // manifest entries; this arm only fires when ingesting a manifest_list
-            // inherited from a pre-B-1 table. Remove once pre-B-1 tables are extinct.
+            // Legacy manifest-list hash-index compatibility: only fires when
+            // ingesting a manifest_list that already contains Data+Puffin
+            // hash-index entries. New commits never emit them.
             ManifestEntryType::FileIndex => {
                 file_index_manifest_manager
                     .add_manifest_entries(manifest_entries, manifest_metadata)?;
@@ -211,23 +219,24 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
 
     // Append puffin blobs into existing manifest entries.
     deletion_vector_manifest_manager.add_new_puffin_blobs(deletion_vector_blobs_to_add)?;
-    // DM(Jerry) B-1: hash-index puffin blobs are no longer registered into the Iceberg
-    // standard manifest_list — that entry shape (Data + Puffin) is out-of-spec and breaks
-    // Spark / pyiceberg readers. New hash blobs flow to Mode 2a PrivateManifestStore in B-2.
+    // Hash-index puffin blobs are no longer registered into the Iceberg
+    // manifest list — that entry shape (Data + Puffin) is rejected by
+    // cross-engine readers (Spark / pyiceberg). New hash blobs flow to
+    // `PrivateManifestStore` instead.
     //
-    // TODO(Jerry) B-1 legacy retention rationale (kept, not deleted, on purpose):
-    // - `file_index_blobs_to_add` and `index_puffin_blobs_to_remove` parameters are still
-    //   on the signature for ABI stability with the upstream `pg_mooncake` callers and
-    //   to keep the diff against upstream `moonlink` small while Phase B stabilizes.
-    // - The `ManifestEntryType::FileIndex` branches above (early-return + manager fan-out
-    //   + finalize) are dead code in greenfield deployments but required to migrate any
-    //   pre-B-1 table whose manifest_list still carries Data+Puffin entries.
-    // - Greenfield-only environments (no pre-B-1 tables, no upstream-shape callers) may
-    //   delete these branches together with `FileIndexManifestManager`, the `FileIndex`
-    //   enum variant, and these two parameters. Gate the deletion on: (a) zero hits in
-    //   the FileIndex branch counter (telemetry to be added in Phase E), and (b) explicit
-    //   confirmation that the public moonlink API does not need to keep accepting these
-    //   parameters for downstream forks.
+    // The legacy compatibility surface is intentionally retained:
+    // - `file_index_blobs_to_add` and `index_puffin_blobs_to_remove` remain on
+    //   the function signature; they are routed to `PrivateManifestStore` by
+    //   `iceberg_table_syncer` after `txn.commit`.
+    // - The `ManifestEntryType::FileIndex` branches (early-return + manager
+    //   fan-out + finalize) are dead code on fresh tables but required to
+    //   ingest legacy manifest lists that still carry Data+Puffin entries.
+    //
+    // Removal conditions, once both are satisfied:
+    //   1. Telemetry confirms zero `FileIndex`-branch hits across loaded
+    //      manifest lists for the deployment lifetime of interest.
+    //   2. No public API caller still relies on `file_index_blobs_to_add` /
+    //      `index_puffin_blobs_to_remove` parameters.
     let _ = file_index_blobs_to_add; // routed to PrivateManifestStore by iceberg_table_syncer post-commit
 
     // Attempt to finalize all existing manifest entries.
@@ -237,10 +246,9 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
     if let Some(manifest_file) = deletion_vector_manifest_manager.finalize().await? {
         manifest_list_writer.add_manifests(std::iter::once(manifest_file))?;
     }
-    // TODO(Jerry) B-1 legacy: finalize() is a no-op for greenfield tables (the manager
-    // never received any entries because new hash blobs bypass this path). Retained to
-    // cover the pre-B-1 migration case described above. Remove together with the two
-    // FileIndex branches in the loop once Phase E telemetry confirms zero hits.
+    // Legacy manifest-list hash-index compatibility finalize: no-op for tables
+    // that never had Data+Puffin hash-index entries. See the removal
+    // conditions above.
     if let Some(manifest_file) = file_index_manifest_manager.finalize().await? {
         manifest_list_writer.add_manifests(std::iter::once(manifest_file))?;
     }

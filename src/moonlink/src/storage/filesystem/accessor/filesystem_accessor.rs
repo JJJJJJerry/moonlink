@@ -187,7 +187,14 @@ impl BaseFileSystemAccess for FileSystemAccessor {
         let sanitized_folder = self.sanitize_path(folder);
         let prefix = format!("{sanitized_folder}/");
         let mut dirs = Vec::new();
-        let lister = self.get_operator().await?.list(&prefix).await?;
+        // Mirror `list_direct_files`: a missing prefix means "no subdirectories",
+        // not an error. Boot reconciliation lists `.markers/` on tables that may
+        // never have written a marker, so the trait must tolerate absence.
+        let lister = match self.get_operator().await?.list(&prefix).await {
+            Ok(lister) => lister,
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
 
         let entries = lister;
         for cur_entry in entries.iter() {

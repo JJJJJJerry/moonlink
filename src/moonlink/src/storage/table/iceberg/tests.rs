@@ -1400,8 +1400,10 @@ async fn test_hash_index_private_manifest_is_cross_engine_safe() {
     assert_current_manifest_list_has_no_file_index_entries(&iceberg_table_manager_for_recovery)
         .await;
 
-    // Mooncake still recovers the hash index through the private manifest, proving
-    // B-1's compatibility fix did not silently drop the index for mooncake itself.
+    // Mooncake still recovers the hash index through the private manifest,
+    // proving the cross-engine compatibility fix (hash entries removed from
+    // the Iceberg manifest list) did not silently drop the index on the
+    // mooncake side.
     assert_eq!(snapshot.disk_files.len(), 3);
     assert_eq!(snapshot.indices.file_indices.len(), 2);
     assert_eq!(snapshot.flush_lsn.unwrap(), 3);
@@ -1420,14 +1422,13 @@ async fn test_hash_index_private_manifest_is_cross_engine_safe() {
 /// remains. Proves both that the post-write cleanup hook ran and that it did
 /// not over-reach into manifest deletion.
 ///
-/// The "every new hash-puffin has a marker" invariant from the earlier
-/// pre-write regression is no longer observable here once `commit_success`
-/// runs — that direction will be re-established by the chaos-infra scenario
-/// `persist_failure_preserves_catalog_blobs` (see IMPLEMENTATION_PLAN.md
-/// §B-9) and by the boot reconciliation negative path, which exercises
-/// markers in their persisted state.
+/// The "every new hash-puffin has a marker" invariant is no longer observable
+/// here once `commit_success` runs. The boot reconciliation negative tests
+/// exercise markers in their persisted state, and a future chaos test
+/// scenario will inject persist failures to re-establish the invariant on
+/// the success path.
 #[tokio::test]
-async fn test_b5d_marker_dir_cleared_after_commit_success() {
+async fn test_commit_success_clears_marker_dir() {
     let iceberg_temp_dir = tempdir().unwrap();
     let private_index_root = format!(
         "{}/_mooncake_private",
@@ -1527,24 +1528,1240 @@ async fn test_b5d_marker_dir_cleared_after_commit_success() {
     }
 }
 
-// NOTE: a session-level failure-injection test for the `peek -> persist ->
-// drain-on-success` ordering (deliberately corrupting the private root mid-
-// commit and checking that the catalog's file-index blob metadata survives
-// for the retry) does not fit at this layer: mooncake's test framework
-// follows the production "single-writer, fail-fatal" model and does not
-// return the iceberg table manager to the table on a persist error, so a
-// retry inside the same session triggers an unrelated `take().unwrap()`
-// panic before the invariant can be observed.
+/// Boot reconciliation: when a marker dir is left over for a snapshot that is
+/// *not* in the live Iceberg snapshot set, the dir and the witnessed
+/// hash-index puffin must be purged on next load.
+///
+/// Setup mirrors a crashed commit: write a real snapshot to bind the
+/// table_uuid dir into existence, then plant a fake
+/// `.markers/<orphan_id>/<uuid>.marker.create` whose payload names a fake
+/// hash-index puffin under the warehouse (matching the production filename
+/// pattern via `utils::get_unique_hash_index_v1_filepath`). The orphan
+/// snapshot id is impossible (Iceberg's snapshot id generator does not
+/// produce it in tests) so it never collides with a real live snapshot.
+#[tokio::test]
+async fn test_boot_reconcile_reaps_orphan_marker_dir() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let private_index_root = format!(
+        "{}/_mooncake_private",
+        iceberg_temp_dir.path().to_str().unwrap()
+    );
+    let mut iceberg_table_config = get_iceberg_table_config(&iceberg_temp_dir);
+    iceberg_table_config.private_index_root = Some(private_index_root.clone());
+
+    let table_temp_dir = tempdir().unwrap();
+    let mooncake_table_metadata =
+        create_test_table_metadata(table_temp_dir.path().to_str().unwrap().to_string());
+    let cache_temp_dir = tempdir().unwrap();
+    let (mut table, mut notify_rx) = create_mooncake_table_and_notify(
+        mooncake_table_metadata.clone(),
+        iceberg_table_config.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+    )
+    .await;
+
+    // Commit one row so the private root's table_uuid dir exists.
+    table.append(test_row_1()).unwrap();
+    table.commit(/*lsn=*/ 1);
+    flush_table_and_sync(&mut table, &mut notify_rx, /*lsn=*/ 1)
+        .await
+        .unwrap();
+    assert!(table.try_create_mooncake_snapshot(SnapshotOption {
+        uuid: uuid::Uuid::new_v4(),
+        force_create: true,
+        dump_snapshot: false,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::Skip,
+        data_compaction_option: MaintenanceOption::Skip,
+    }));
+    let (_, persistence_snapshot_payload, _, _, _) =
+        sync_mooncake_snapshot(&mut table, &mut notify_rx).await;
+    create_iceberg_snapshot(&mut table, persistence_snapshot_payload, &mut notify_rx)
+        .await
+        .unwrap();
+    drop(table);
+
+    // Discover the table_uuid directory under the private root.
+    let private_root_path = std::path::Path::new(&private_index_root);
+    let table_dirs: Vec<_> = std::fs::read_dir(private_root_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .collect();
+    assert_eq!(table_dirs.len(), 1);
+    let table_root = table_dirs[0].path();
+
+    // Plant an orphan marker dir + a fake hash-index puffin under the
+    // warehouse's data root. The path matches mooncake's production filename
+    // pattern (`<uuid7>-hash-index-v1-puffin.bin`) — the same shape the syncer
+    // produces via `utils::get_unique_hash_index_v1_filepath`. The fake puffin
+    // is **not** referenced by the live snapshot's private manifest, so
+    // classify_marker_target returns Trusted(HashPuffin), the in-use set check
+    // misses, and the artifact is deleted.
+    const ORPHAN_SNAPSHOT_ID: i64 = 99_999;
+    let orphan_marker_dir = table_root
+        .join(".markers")
+        .join(ORPHAN_SNAPSHOT_ID.to_string());
+    std::fs::create_dir_all(&orphan_marker_dir).unwrap();
+    let warehouse_data_dir = iceberg_temp_dir
+        .path()
+        .join(ICEBERG_TEST_NAMESPACE)
+        .join(ICEBERG_TEST_TABLE)
+        .join("data");
+    std::fs::create_dir_all(&warehouse_data_dir).unwrap();
+    let orphan_puffin =
+        warehouse_data_dir.join(format!("{}-hash-index-v1-puffin.bin", uuid::Uuid::new_v4()));
+    std::fs::write(&orphan_puffin, b"orphan puffin").unwrap();
+    let marker_payload = serde_json::json!({
+        "schema_version": "v1",
+        "snapshot_id": ORPHAN_SNAPSHOT_ID,
+        "file_path": orphan_puffin.to_str().unwrap(),
+        "op": "create",
+    });
+    let marker_file = orphan_marker_dir.join(format!("{}.marker.create", uuid::Uuid::new_v4()));
+    std::fs::write(&marker_file, serde_json::to_vec(&marker_payload).unwrap()).unwrap();
+
+    let filesystem_accessor = create_test_filesystem_accessor(&iceberg_table_config);
+    let mut recovery = IcebergTableManager::new(
+        mooncake_table_metadata.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+        filesystem_accessor,
+        iceberg_table_config.clone(),
+    )
+    .await
+    .unwrap();
+    let _ = recovery.load_snapshot_from_table().await.unwrap();
+
+    assert!(
+        !orphan_marker_dir.exists(),
+        "boot reconciliation must purge .markers/{ORPHAN_SNAPSHOT_ID}/, found {orphan_marker_dir:?}"
+    );
+    assert!(
+        !orphan_puffin.exists(),
+        "boot reconciliation must delete the orphan hash puffin referenced by the hanging marker, found {orphan_puffin:?}"
+    );
+}
+
+/// When the current Iceberg snapshot has no corresponding private manifest,
+/// the load path must not panic — the missing manifest is logged as
+/// quarantine and the table comes online with degraded (empty) hash indices.
+/// Operator intervention restores the index later; the boot itself must
+/// succeed so the table can serve data files immediately.
+#[tokio::test]
+async fn test_boot_reconcile_tolerates_missing_current_manifest() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let private_index_root = format!(
+        "{}/_mooncake_private",
+        iceberg_temp_dir.path().to_str().unwrap()
+    );
+    let mut iceberg_table_config = get_iceberg_table_config(&iceberg_temp_dir);
+    iceberg_table_config.private_index_root = Some(private_index_root.clone());
+
+    let table_temp_dir = tempdir().unwrap();
+    let mooncake_table_metadata =
+        create_test_table_metadata(table_temp_dir.path().to_str().unwrap().to_string());
+    let cache_temp_dir = tempdir().unwrap();
+    let (mut table, mut notify_rx) = create_mooncake_table_and_notify(
+        mooncake_table_metadata.clone(),
+        iceberg_table_config.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+    )
+    .await;
+
+    table.append(test_row_1()).unwrap();
+    table.commit(/*lsn=*/ 1);
+    flush_table_and_sync(&mut table, &mut notify_rx, /*lsn=*/ 1)
+        .await
+        .unwrap();
+    assert!(table.try_create_mooncake_snapshot(SnapshotOption {
+        uuid: uuid::Uuid::new_v4(),
+        force_create: true,
+        dump_snapshot: false,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::Skip,
+        data_compaction_option: MaintenanceOption::Skip,
+    }));
+    let (_, persistence_snapshot_payload, _, _, _) =
+        sync_mooncake_snapshot(&mut table, &mut notify_rx).await;
+    create_iceberg_snapshot(&mut table, persistence_snapshot_payload, &mut notify_rx)
+        .await
+        .unwrap();
+    drop(table);
+
+    // Simulate the gap where an Iceberg commit landed but the matching
+    // private manifest write did not: delete the private manifest
+    // that landed in the happy path, leaving only the Iceberg side.
+    let private_root_path = std::path::Path::new(&private_index_root);
+    let table_dirs: Vec<_> = std::fs::read_dir(private_root_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .collect();
+    let manifest_dir = table_dirs[0].path().join("manifest");
+    for entry in std::fs::read_dir(&manifest_dir).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::remove_file(entry.path()).unwrap();
+    }
+
+    let filesystem_accessor = create_test_filesystem_accessor(&iceberg_table_config);
+    let mut recovery = IcebergTableManager::new(
+        mooncake_table_metadata.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+        filesystem_accessor,
+        iceberg_table_config.clone(),
+    )
+    .await
+    .unwrap();
+    let (_, snapshot) = recovery
+        .load_snapshot_from_table()
+        .await
+        .expect("missing private manifest should not prevent table load");
+
+    // Data files survive (they live in the Iceberg manifest, not the private one);
+    // hash indices were exclusively in the private manifest, so they degrade to empty.
+    assert_eq!(snapshot.disk_files.len(), 1);
+    assert!(
+        snapshot.indices.file_indices.is_empty(),
+        "missing private manifest must degrade hash indices to empty, got {} file indices",
+        snapshot.indices.file_indices.len()
+    );
+}
+
+/// Boot reconciliation must be a no-op on a healthy table: a clean second open
+/// preserves all snapshot state. Guards against an over-eager probe deleting
+/// markers, manifests, or staging files for live snapshots.
+#[tokio::test]
+async fn test_boot_reconcile_is_noop_on_clean_table() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let private_index_root = format!(
+        "{}/_mooncake_private",
+        iceberg_temp_dir.path().to_str().unwrap()
+    );
+    let mut iceberg_table_config = get_iceberg_table_config(&iceberg_temp_dir);
+    iceberg_table_config.private_index_root = Some(private_index_root.clone());
+
+    let table_temp_dir = tempdir().unwrap();
+    let mooncake_table_metadata =
+        create_test_table_metadata(table_temp_dir.path().to_str().unwrap().to_string());
+    let cache_temp_dir = tempdir().unwrap();
+    let (mut table, mut notify_rx) = create_mooncake_table_and_notify(
+        mooncake_table_metadata.clone(),
+        iceberg_table_config.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+    )
+    .await;
+
+    table.append(test_row_1()).unwrap();
+    table.commit(/*lsn=*/ 1);
+    flush_table_and_sync(&mut table, &mut notify_rx, /*lsn=*/ 1)
+        .await
+        .unwrap();
+    assert!(table.try_create_mooncake_snapshot(SnapshotOption {
+        uuid: uuid::Uuid::new_v4(),
+        force_create: true,
+        dump_snapshot: false,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::Skip,
+        data_compaction_option: MaintenanceOption::Skip,
+    }));
+    let (_, persistence_snapshot_payload, _, _, _) =
+        sync_mooncake_snapshot(&mut table, &mut notify_rx).await;
+    create_iceberg_snapshot(&mut table, persistence_snapshot_payload, &mut notify_rx)
+        .await
+        .unwrap();
+    drop(table);
+
+    let private_root_path = std::path::Path::new(&private_index_root);
+    let table_dirs: Vec<_> = std::fs::read_dir(private_root_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .collect();
+    let table_root = table_dirs[0].path();
+    let manifest_files_before: Vec<_> = std::fs::read_dir(table_root.join("manifest"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(manifest_files_before.len(), 1);
+
+    // Reload — reconciliation runs, must not touch anything.
+    let filesystem_accessor = create_test_filesystem_accessor(&iceberg_table_config);
+    let mut recovery = IcebergTableManager::new(
+        mooncake_table_metadata.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+        filesystem_accessor,
+        iceberg_table_config.clone(),
+    )
+    .await
+    .unwrap();
+    let (_, snapshot) = recovery.load_snapshot_from_table().await.unwrap();
+
+    // Data + hash indices intact.
+    assert_eq!(snapshot.disk_files.len(), 1);
+    assert_eq!(snapshot.indices.file_indices.len(), 1);
+
+    // Manifest still on disk.
+    let manifest_files_after: Vec<_> = std::fs::read_dir(table_root.join("manifest"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(manifest_files_after, manifest_files_before);
+}
+
+/// Boot reconciliation must not delete artifacts that some live snapshot
+/// still references through parent-manifest inheritance. Setup: write one
+/// snapshot whose private manifest entries pin a puffin path; plant a marker
+/// dir for an expired `<orphan_id>` whose marker payload names the **same**
+/// puffin path. Reconciliation must purge the marker dir without touching
+/// the puffin, and must not delete the manifest entry that depends on it.
+#[tokio::test]
+async fn test_boot_reconcile_skips_artifact_referenced_by_live_snapshot() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let private_index_root = format!(
+        "{}/_mooncake_private",
+        iceberg_temp_dir.path().to_str().unwrap()
+    );
+    let mut iceberg_table_config = get_iceberg_table_config(&iceberg_temp_dir);
+    iceberg_table_config.private_index_root = Some(private_index_root.clone());
+
+    let table_temp_dir = tempdir().unwrap();
+    let mooncake_table_metadata =
+        create_test_table_metadata(table_temp_dir.path().to_str().unwrap().to_string());
+    let cache_temp_dir = tempdir().unwrap();
+    let (mut table, mut notify_rx) = create_mooncake_table_and_notify(
+        mooncake_table_metadata.clone(),
+        iceberg_table_config.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+    )
+    .await;
+
+    table.append(test_row_1()).unwrap();
+    table.commit(/*lsn=*/ 1);
+    flush_table_and_sync(&mut table, &mut notify_rx, /*lsn=*/ 1)
+        .await
+        .unwrap();
+    assert!(table.try_create_mooncake_snapshot(SnapshotOption {
+        uuid: uuid::Uuid::new_v4(),
+        force_create: true,
+        dump_snapshot: false,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::Skip,
+        data_compaction_option: MaintenanceOption::Skip,
+    }));
+    let (_, persistence_snapshot_payload, _, _, _) =
+        sync_mooncake_snapshot(&mut table, &mut notify_rx).await;
+    create_iceberg_snapshot(&mut table, persistence_snapshot_payload, &mut notify_rx)
+        .await
+        .unwrap();
+    drop(table);
+
+    // Discover table_uuid dir and the live puffin path the private manifest pins.
+    let private_root_path = std::path::Path::new(&private_index_root);
+    let table_root = std::fs::read_dir(private_root_path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+    let manifest_files: Vec<_> = std::fs::read_dir(table_root.join("manifest"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    let manifest_bytes = std::fs::read(manifest_files[0].path()).unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+    let live_puffin_path = manifest
+        .pointer("/hash_index_entries/0/puffin_file_path")
+        .and_then(|v| v.as_str())
+        .expect("expected at least one hash_index_entries entry")
+        .to_string();
+    assert!(
+        std::path::Path::new(&live_puffin_path).exists(),
+        "test precondition: live puffin must exist on disk"
+    );
+
+    // Plant a marker dir for an expired snapshot id, pointing at the SAME puffin.
+    const ORPHAN_SNAPSHOT_ID: i64 = 99_999;
+    let orphan_marker_dir = table_root
+        .join(".markers")
+        .join(ORPHAN_SNAPSHOT_ID.to_string());
+    std::fs::create_dir_all(&orphan_marker_dir).unwrap();
+    let marker_payload = serde_json::json!({
+        "schema_version": "v1",
+        "snapshot_id": ORPHAN_SNAPSHOT_ID,
+        "file_path": live_puffin_path,
+        "op": "create",
+    });
+    std::fs::write(
+        orphan_marker_dir.join(format!("{}.marker.create", uuid::Uuid::new_v4())),
+        serde_json::to_vec(&marker_payload).unwrap(),
+    )
+    .unwrap();
+
+    // Reload — reconciliation must skip the live-referenced puffin and still purge the dir.
+    let filesystem_accessor = create_test_filesystem_accessor(&iceberg_table_config);
+    let mut recovery = IcebergTableManager::new(
+        mooncake_table_metadata.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+        filesystem_accessor,
+        iceberg_table_config.clone(),
+    )
+    .await
+    .unwrap();
+    let (_, snapshot) = recovery.load_snapshot_from_table().await.unwrap();
+
+    assert!(
+        !orphan_marker_dir.exists(),
+        "orphan marker dir should be purged after reconciliation handles its (referenced) payload"
+    );
+    assert!(
+        std::path::Path::new(&live_puffin_path).exists(),
+        "live-referenced puffin must NOT be deleted by reconciliation, even though a hanging marker named it"
+    );
+    // Hash indices still load from the current manifest, proving the live
+    // snapshot's dependency on this puffin is intact.
+    assert_eq!(snapshot.indices.file_indices.len(), 1);
+}
+
+/// Boot reconciliation treats a marker whose `file_path` falls outside the table's private
+/// root as untrusted: it must NOT be deleted (defense in depth against a stale
+/// or corrupt marker payload) and the marker dir must be retained so an
+/// operator can review.
+#[tokio::test]
+async fn test_boot_reconcile_quarantines_untrusted_path() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let private_index_root = format!(
+        "{}/_mooncake_private",
+        iceberg_temp_dir.path().to_str().unwrap()
+    );
+    let mut iceberg_table_config = get_iceberg_table_config(&iceberg_temp_dir);
+    iceberg_table_config.private_index_root = Some(private_index_root.clone());
+
+    let table_temp_dir = tempdir().unwrap();
+    let mooncake_table_metadata =
+        create_test_table_metadata(table_temp_dir.path().to_str().unwrap().to_string());
+    let cache_temp_dir = tempdir().unwrap();
+    let (mut table, mut notify_rx) = create_mooncake_table_and_notify(
+        mooncake_table_metadata.clone(),
+        iceberg_table_config.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+    )
+    .await;
+    table.append(test_row_1()).unwrap();
+    table.commit(/*lsn=*/ 1);
+    flush_table_and_sync(&mut table, &mut notify_rx, /*lsn=*/ 1)
+        .await
+        .unwrap();
+    assert!(table.try_create_mooncake_snapshot(SnapshotOption {
+        uuid: uuid::Uuid::new_v4(),
+        force_create: true,
+        dump_snapshot: false,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::Skip,
+        data_compaction_option: MaintenanceOption::Skip,
+    }));
+    let (_, persistence_snapshot_payload, _, _, _) =
+        sync_mooncake_snapshot(&mut table, &mut notify_rx).await;
+    create_iceberg_snapshot(&mut table, persistence_snapshot_payload, &mut notify_rx)
+        .await
+        .unwrap();
+    drop(table);
+
+    let table_root = std::fs::read_dir(&private_index_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+
+    // Plant a victim file OUTSIDE the table's private root. If reconciliation
+    // blindly trusts the marker payload it will delete this file.
+    let outsider = iceberg_temp_dir.path().join("outsider.txt");
+    std::fs::write(&outsider, b"do not delete").unwrap();
+
+    const ORPHAN_SNAPSHOT_ID: i64 = 99_998;
+    let orphan_marker_dir = table_root
+        .join(".markers")
+        .join(ORPHAN_SNAPSHOT_ID.to_string());
+    std::fs::create_dir_all(&orphan_marker_dir).unwrap();
+    let marker_payload = serde_json::json!({
+        "schema_version": "v1",
+        "snapshot_id": ORPHAN_SNAPSHOT_ID,
+        "file_path": outsider.to_str().unwrap(),
+        "op": "create",
+    });
+    std::fs::write(
+        orphan_marker_dir.join(format!("{}.marker.create", uuid::Uuid::new_v4())),
+        serde_json::to_vec(&marker_payload).unwrap(),
+    )
+    .unwrap();
+
+    let filesystem_accessor = create_test_filesystem_accessor(&iceberg_table_config);
+    let mut recovery = IcebergTableManager::new(
+        mooncake_table_metadata.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+        filesystem_accessor,
+        iceberg_table_config.clone(),
+    )
+    .await
+    .unwrap();
+    let _ = recovery.load_snapshot_from_table().await.unwrap();
+
+    assert!(
+        outsider.exists(),
+        "boot reconciliation must not follow a marker file_path outside the table's private root"
+    );
+    assert!(
+        orphan_marker_dir.exists(),
+        "untrusted marker dir must be retained so the operator can review"
+    );
+}
+
+/// When boot reconciliation cannot delete a witnessed artifact (transient IO, permissions),
+/// it must NOT purge the marker dir — losing the marker means losing the
+/// recovery hint for the next boot's retry.
+///
+/// Simulated by replacing the staging path with a directory containing a file:
+/// opendal's local-fs `delete` then errors (cannot remove a non-empty directory
+/// with a file-delete operation), exercising the retain-marker-dir branch.
+#[tokio::test]
+async fn test_boot_reconcile_retains_marker_dir_when_delete_fails() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let private_index_root = format!(
+        "{}/_mooncake_private",
+        iceberg_temp_dir.path().to_str().unwrap()
+    );
+    let mut iceberg_table_config = get_iceberg_table_config(&iceberg_temp_dir);
+    iceberg_table_config.private_index_root = Some(private_index_root.clone());
+
+    let table_temp_dir = tempdir().unwrap();
+    let mooncake_table_metadata =
+        create_test_table_metadata(table_temp_dir.path().to_str().unwrap().to_string());
+    let cache_temp_dir = tempdir().unwrap();
+    let (mut table, mut notify_rx) = create_mooncake_table_and_notify(
+        mooncake_table_metadata.clone(),
+        iceberg_table_config.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+    )
+    .await;
+    table.append(test_row_1()).unwrap();
+    table.commit(/*lsn=*/ 1);
+    flush_table_and_sync(&mut table, &mut notify_rx, /*lsn=*/ 1)
+        .await
+        .unwrap();
+    assert!(table.try_create_mooncake_snapshot(SnapshotOption {
+        uuid: uuid::Uuid::new_v4(),
+        force_create: true,
+        dump_snapshot: false,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::Skip,
+        data_compaction_option: MaintenanceOption::Skip,
+    }));
+    let (_, persistence_snapshot_payload, _, _, _) =
+        sync_mooncake_snapshot(&mut table, &mut notify_rx).await;
+    create_iceberg_snapshot(&mut table, persistence_snapshot_payload, &mut notify_rx)
+        .await
+        .unwrap();
+    drop(table);
+
+    let table_root = std::fs::read_dir(&private_index_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+
+    // Plant a hash-puffin-shape path (so the classifier reaches the delete
+    // branch) as a NON-EMPTY directory: opendal's file-delete fails on this
+    // shape (NotEmpty / IsADirectory), simulating a transient delete error
+    // without needing chmod or a chaos accessor.
+    const ORPHAN_SNAPSHOT_ID: i64 = 99_997;
+    let warehouse_data_dir = iceberg_temp_dir
+        .path()
+        .join(ICEBERG_TEST_NAMESPACE)
+        .join(ICEBERG_TEST_TABLE)
+        .join("data");
+    std::fs::create_dir_all(&warehouse_data_dir).unwrap();
+    let locked_puffin =
+        warehouse_data_dir.join(format!("{}-hash-index-v1-puffin.bin", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&locked_puffin).unwrap();
+    std::fs::write(locked_puffin.join("sentinel"), b"keep me").unwrap();
+
+    let orphan_marker_dir = table_root
+        .join(".markers")
+        .join(ORPHAN_SNAPSHOT_ID.to_string());
+    std::fs::create_dir_all(&orphan_marker_dir).unwrap();
+    let marker_payload = serde_json::json!({
+        "schema_version": "v1",
+        "snapshot_id": ORPHAN_SNAPSHOT_ID,
+        "file_path": locked_puffin.to_str().unwrap(),
+        "op": "create",
+    });
+    std::fs::write(
+        orphan_marker_dir.join(format!("{}.marker.create", uuid::Uuid::new_v4())),
+        serde_json::to_vec(&marker_payload).unwrap(),
+    )
+    .unwrap();
+
+    let filesystem_accessor = create_test_filesystem_accessor(&iceberg_table_config);
+    let mut recovery = IcebergTableManager::new(
+        mooncake_table_metadata.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+        filesystem_accessor,
+        iceberg_table_config.clone(),
+    )
+    .await
+    .unwrap();
+    let _ = recovery.load_snapshot_from_table().await.unwrap();
+
+    assert!(
+        orphan_marker_dir.exists(),
+        "marker dir must be retained when artifact delete fails — losing it discards retry evidence"
+    );
+}
+
+/// The sandbox must not treat the entire table location as deletable. A marker
+/// payload pointing at a real Iceberg data parquet (under `<table>/data/`,
+/// but not matching mooncake's `*-hash-index-v1-puffin.bin` suffix) must be
+/// quarantined — otherwise a stale or corrupt marker could erase live data.
+#[tokio::test]
+async fn test_boot_reconcile_quarantines_marker_targeting_data_parquet() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let private_index_root = format!(
+        "{}/_mooncake_private",
+        iceberg_temp_dir.path().to_str().unwrap()
+    );
+    let mut iceberg_table_config = get_iceberg_table_config(&iceberg_temp_dir);
+    iceberg_table_config.private_index_root = Some(private_index_root.clone());
+
+    let table_temp_dir = tempdir().unwrap();
+    let mooncake_table_metadata =
+        create_test_table_metadata(table_temp_dir.path().to_str().unwrap().to_string());
+    let cache_temp_dir = tempdir().unwrap();
+    let (mut table, mut notify_rx) = create_mooncake_table_and_notify(
+        mooncake_table_metadata.clone(),
+        iceberg_table_config.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+    )
+    .await;
+    table.append(test_row_1()).unwrap();
+    table.commit(/*lsn=*/ 1);
+    flush_table_and_sync(&mut table, &mut notify_rx, /*lsn=*/ 1)
+        .await
+        .unwrap();
+    assert!(table.try_create_mooncake_snapshot(SnapshotOption {
+        uuid: uuid::Uuid::new_v4(),
+        force_create: true,
+        dump_snapshot: false,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::Skip,
+        data_compaction_option: MaintenanceOption::Skip,
+    }));
+    let (_, persistence_snapshot_payload, _, _, _) =
+        sync_mooncake_snapshot(&mut table, &mut notify_rx).await;
+    create_iceberg_snapshot(&mut table, persistence_snapshot_payload, &mut notify_rx)
+        .await
+        .unwrap();
+    drop(table);
+
+    // Discover the real data parquet Iceberg wrote. It lives under
+    // `<warehouse>/<namespace>/<table>/data/...parquet` and is by definition
+    // **not** something mooncake's recovery path is allowed to touch.
+    let warehouse_root = iceberg_temp_dir
+        .path()
+        .join(ICEBERG_TEST_NAMESPACE)
+        .join(ICEBERG_TEST_TABLE);
+    let data_dir = warehouse_root.join("data");
+    let data_parquet = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            e.path()
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
+        })
+        .expect("expected a data parquet under <warehouse>/<ns>/<table>/data/")
+        .path();
+    assert!(data_parquet.exists());
+
+    let table_root_in_private = std::fs::read_dir(&private_index_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+    const ORPHAN_SNAPSHOT_ID: i64 = 99_990;
+    let orphan_marker_dir = table_root_in_private
+        .join(".markers")
+        .join(ORPHAN_SNAPSHOT_ID.to_string());
+    std::fs::create_dir_all(&orphan_marker_dir).unwrap();
+    let marker_payload = serde_json::json!({
+        "schema_version": "v1",
+        "snapshot_id": ORPHAN_SNAPSHOT_ID,
+        "file_path": data_parquet.to_str().unwrap(),
+        "op": "create",
+    });
+    std::fs::write(
+        orphan_marker_dir.join(format!("{}.marker.create", uuid::Uuid::new_v4())),
+        serde_json::to_vec(&marker_payload).unwrap(),
+    )
+    .unwrap();
+
+    let filesystem_accessor = create_test_filesystem_accessor(&iceberg_table_config);
+    let mut recovery = IcebergTableManager::new(
+        mooncake_table_metadata.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+        filesystem_accessor,
+        iceberg_table_config.clone(),
+    )
+    .await
+    .unwrap();
+    let _ = recovery.load_snapshot_from_table().await.unwrap();
+
+    assert!(
+        data_parquet.exists(),
+        "real Iceberg data parquet must NOT be deleted just because a marker payload named it"
+    );
+    assert!(
+        orphan_marker_dir.exists(),
+        "untrusted (non-puffin) marker dir must be retained for operator review"
+    );
+}
+
+/// A marker payload containing a `..` segment is treated as untrusted and
+/// quarantined, even when its raw prefix would otherwise match the sandbox.
+/// Defense in depth against a stale writer that produces relative escapes.
+#[tokio::test]
+async fn test_boot_reconcile_quarantines_marker_with_dotdot_segment() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let private_index_root = format!(
+        "{}/_mooncake_private",
+        iceberg_temp_dir.path().to_str().unwrap()
+    );
+    let mut iceberg_table_config = get_iceberg_table_config(&iceberg_temp_dir);
+    iceberg_table_config.private_index_root = Some(private_index_root.clone());
+
+    let table_temp_dir = tempdir().unwrap();
+    let mooncake_table_metadata =
+        create_test_table_metadata(table_temp_dir.path().to_str().unwrap().to_string());
+    let cache_temp_dir = tempdir().unwrap();
+    let (mut table, mut notify_rx) = create_mooncake_table_and_notify(
+        mooncake_table_metadata.clone(),
+        iceberg_table_config.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+    )
+    .await;
+    table.append(test_row_1()).unwrap();
+    table.commit(/*lsn=*/ 1);
+    flush_table_and_sync(&mut table, &mut notify_rx, /*lsn=*/ 1)
+        .await
+        .unwrap();
+    assert!(table.try_create_mooncake_snapshot(SnapshotOption {
+        uuid: uuid::Uuid::new_v4(),
+        force_create: true,
+        dump_snapshot: false,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::Skip,
+        data_compaction_option: MaintenanceOption::Skip,
+    }));
+    let (_, persistence_snapshot_payload, _, _, _) =
+        sync_mooncake_snapshot(&mut table, &mut notify_rx).await;
+    create_iceberg_snapshot(&mut table, persistence_snapshot_payload, &mut notify_rx)
+        .await
+        .unwrap();
+    drop(table);
+
+    let table_root = std::fs::read_dir(&private_index_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+
+    let victim = iceberg_temp_dir.path().join("escape-target.bin");
+    std::fs::write(&victim, b"do not delete").unwrap();
+    // Craft a path whose raw prefix matches the private root but whose
+    // segments escape via `..`. classify_marker_target must reject this.
+    let escaping_path = format!(
+        "{}/..//{}",
+        table_root.to_str().unwrap(),
+        victim.file_name().unwrap().to_str().unwrap()
+    );
+
+    const ORPHAN_SNAPSHOT_ID: i64 = 99_991;
+    let orphan_marker_dir = table_root
+        .join(".markers")
+        .join(ORPHAN_SNAPSHOT_ID.to_string());
+    std::fs::create_dir_all(&orphan_marker_dir).unwrap();
+    let marker_payload = serde_json::json!({
+        "schema_version": "v1",
+        "snapshot_id": ORPHAN_SNAPSHOT_ID,
+        "file_path": escaping_path,
+        "op": "create",
+    });
+    std::fs::write(
+        orphan_marker_dir.join(format!("{}.marker.create", uuid::Uuid::new_v4())),
+        serde_json::to_vec(&marker_payload).unwrap(),
+    )
+    .unwrap();
+
+    let filesystem_accessor = create_test_filesystem_accessor(&iceberg_table_config);
+    let mut recovery = IcebergTableManager::new(
+        mooncake_table_metadata.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+        filesystem_accessor,
+        iceberg_table_config.clone(),
+    )
+    .await
+    .unwrap();
+    let _ = recovery.load_snapshot_from_table().await.unwrap();
+
+    assert!(
+        victim.exists(),
+        "path-traversal marker must not be followed"
+    );
+    assert!(
+        orphan_marker_dir.exists(),
+        "marker dir with .. payload must be retained for operator review"
+    );
+}
+
+/// When at least one live snapshot's private manifest cannot be read, the
+/// in-use set is no longer a sound witness for parent-inheritance references.
+/// In that case the marker-side reconciliation must fail-closed on table-root
+/// puffins (retain the marker dir, do not delete) so a transient read failure
+/// cannot snowball into data loss. Verified by writing two commits, then
+/// corrupting the **older** live snapshot's private manifest — the *current*
+/// snapshot's manifest stays intact so the load path itself still succeeds,
+/// but the in-use witness build hits the corruption and downgrades to
+/// unreliable.
+#[tokio::test]
+async fn test_boot_reconcile_fails_closed_when_in_use_witness_unreliable() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let private_index_root = format!(
+        "{}/_mooncake_private",
+        iceberg_temp_dir.path().to_str().unwrap()
+    );
+    let mut iceberg_table_config = get_iceberg_table_config(&iceberg_temp_dir);
+    iceberg_table_config.private_index_root = Some(private_index_root.clone());
+
+    let table_temp_dir = tempdir().unwrap();
+    let mooncake_table_metadata =
+        create_test_table_metadata(table_temp_dir.path().to_str().unwrap().to_string());
+    let cache_temp_dir = tempdir().unwrap();
+    let (mut table, mut notify_rx) = create_mooncake_table_and_notify(
+        mooncake_table_metadata.clone(),
+        iceberg_table_config.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+    )
+    .await;
+    for (lsn, row) in [(1, test_row_1()), (2, test_row_2())] {
+        table.append(row).unwrap();
+        table.commit(lsn);
+        flush_table_and_sync(&mut table, &mut notify_rx, lsn)
+            .await
+            .unwrap();
+        assert!(table.try_create_mooncake_snapshot(SnapshotOption {
+            uuid: uuid::Uuid::new_v4(),
+            force_create: true,
+            dump_snapshot: false,
+            iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+            index_merge_option: MaintenanceOption::Skip,
+            data_compaction_option: MaintenanceOption::Skip,
+        }));
+        let (_, persistence_snapshot_payload, _, _, _) =
+            sync_mooncake_snapshot(&mut table, &mut notify_rx).await;
+        let persistence_snapshot_result =
+            create_iceberg_snapshot(&mut table, persistence_snapshot_payload, &mut notify_rx)
+                .await
+                .unwrap();
+        // Return the iceberg table manager ownership to the table so the next
+        // iteration can drive another commit — mooncake is fail-fatal on a
+        // missing manager handle.
+        table.set_persistence_snapshot_res(persistence_snapshot_result);
+    }
+    drop(table);
+
+    let table_root = std::fs::read_dir(&private_index_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+
+    // Discover the current snapshot id from Iceberg's metadata.json so we can
+    // leave its private manifest intact (the load path needs to read it) and
+    // corrupt the OTHER live snapshot's manifest. Iceberg snapshot ids are
+    // randomized — sorting `snap-<id>.json` filenames by id is **not** the
+    // same as sorting by age.
+    let metadata_dir = iceberg_temp_dir
+        .path()
+        .join(ICEBERG_TEST_NAMESPACE)
+        .join(ICEBERG_TEST_TABLE)
+        .join("metadata");
+    let version = std::fs::read_to_string(metadata_dir.join("version-hint.text"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let metadata_json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(metadata_dir.join(format!("v{version}.metadata.json"))).unwrap(),
+    )
+    .unwrap();
+    let current_snapshot_id = metadata_json
+        .get("current-snapshot-id")
+        .and_then(|v| v.as_i64())
+        .expect("metadata.json must carry current-snapshot-id after two commits");
+
+    let manifest_dir = table_root.join("manifest");
+    let manifest_paths: Vec<_> = std::fs::read_dir(&manifest_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(manifest_paths.len(), 2, "expected two snapshot manifests");
+    let older_manifest = manifest_paths
+        .iter()
+        .find(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("snap-"))
+                .and_then(|s| s.parse::<i64>().ok())
+                != Some(current_snapshot_id)
+        })
+        .expect("expected one non-current manifest to corrupt");
+    std::fs::write(older_manifest, b"not-json").unwrap();
+
+    // Plant a hanging marker pointing at a hash-puffin path under the
+    // warehouse. The path must match the puffin-name suffix so classification
+    // resolves to `Trusted(HashPuffin)` — that is the branch fail-closed has
+    // to guard.
+    let warehouse_root = iceberg_temp_dir
+        .path()
+        .join(ICEBERG_TEST_NAMESPACE)
+        .join(ICEBERG_TEST_TABLE);
+    let synthetic_puffin = warehouse_root
+        .join("data")
+        .join(format!("{}-hash-index-v1-puffin.bin", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(synthetic_puffin.parent().unwrap()).unwrap();
+    std::fs::write(&synthetic_puffin, b"pretend puffin").unwrap();
+
+    const ORPHAN_SNAPSHOT_ID: i64 = 99_992;
+    let orphan_marker_dir = table_root
+        .join(".markers")
+        .join(ORPHAN_SNAPSHOT_ID.to_string());
+    std::fs::create_dir_all(&orphan_marker_dir).unwrap();
+    let marker_payload = serde_json::json!({
+        "schema_version": "v1",
+        "snapshot_id": ORPHAN_SNAPSHOT_ID,
+        "file_path": synthetic_puffin.to_str().unwrap(),
+        "op": "create",
+    });
+    std::fs::write(
+        orphan_marker_dir.join(format!("{}.marker.create", uuid::Uuid::new_v4())),
+        serde_json::to_vec(&marker_payload).unwrap(),
+    )
+    .unwrap();
+
+    let filesystem_accessor = create_test_filesystem_accessor(&iceberg_table_config);
+    let mut recovery = IcebergTableManager::new(
+        mooncake_table_metadata.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+        filesystem_accessor,
+        iceberg_table_config.clone(),
+    )
+    .await
+    .unwrap();
+    let _ = recovery.load_snapshot_from_table().await.unwrap();
+
+    assert!(
+        synthetic_puffin.exists(),
+        "fail-closed: hash-puffin under table root must NOT be deleted when the in-use witness is unreliable"
+    );
+    assert!(
+        orphan_marker_dir.exists(),
+        "marker dir must be retained when fail-closed skipped the puffin — retry next boot"
+    );
+}
+
+/// A marker for snapshot X must only be allowed to authorize deletion of
+/// snapshot X's own private manifest (`manifest/snap-X.json`). A payload
+/// naming **another** snapshot's manifest is quarantined — otherwise a stale
+/// or corrupt marker could erase a still-live snapshot's private manifest.
+#[tokio::test]
+async fn test_boot_reconcile_quarantines_marker_naming_other_snapshot_manifest() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let private_index_root = format!(
+        "{}/_mooncake_private",
+        iceberg_temp_dir.path().to_str().unwrap()
+    );
+    let mut iceberg_table_config = get_iceberg_table_config(&iceberg_temp_dir);
+    iceberg_table_config.private_index_root = Some(private_index_root.clone());
+
+    let table_temp_dir = tempdir().unwrap();
+    let mooncake_table_metadata =
+        create_test_table_metadata(table_temp_dir.path().to_str().unwrap().to_string());
+    let cache_temp_dir = tempdir().unwrap();
+    let (mut table, mut notify_rx) = create_mooncake_table_and_notify(
+        mooncake_table_metadata.clone(),
+        iceberg_table_config.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+    )
+    .await;
+    table.append(test_row_1()).unwrap();
+    table.commit(/*lsn=*/ 1);
+    flush_table_and_sync(&mut table, &mut notify_rx, /*lsn=*/ 1)
+        .await
+        .unwrap();
+    assert!(table.try_create_mooncake_snapshot(SnapshotOption {
+        uuid: uuid::Uuid::new_v4(),
+        force_create: true,
+        dump_snapshot: false,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::Skip,
+        data_compaction_option: MaintenanceOption::Skip,
+    }));
+    let (_, persistence_snapshot_payload, _, _, _) =
+        sync_mooncake_snapshot(&mut table, &mut notify_rx).await;
+    create_iceberg_snapshot(&mut table, persistence_snapshot_payload, &mut notify_rx)
+        .await
+        .unwrap();
+    drop(table);
+
+    let table_root = std::fs::read_dir(&private_index_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+
+    // Capture the live snapshot's actual manifest path; this is the target
+    // that must NOT be deleted. The marker we plant impersonates a different
+    // (orphan) snapshot but names this live manifest as its `file_path`.
+    let manifest_dir = table_root.join("manifest");
+    let live_manifest = std::fs::read_dir(&manifest_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .next()
+        .unwrap()
+        .path();
+    let live_manifest_bytes_before = std::fs::read(&live_manifest).unwrap();
+
+    const ORPHAN_SNAPSHOT_ID: i64 = 99_996;
+    let orphan_marker_dir = table_root
+        .join(".markers")
+        .join(ORPHAN_SNAPSHOT_ID.to_string());
+    std::fs::create_dir_all(&orphan_marker_dir).unwrap();
+    let marker_payload = serde_json::json!({
+        "schema_version": "v1",
+        "snapshot_id": ORPHAN_SNAPSHOT_ID,
+        "file_path": live_manifest.to_str().unwrap(),
+        "op": "create",
+    });
+    std::fs::write(
+        orphan_marker_dir.join(format!("{}.marker.create", uuid::Uuid::new_v4())),
+        serde_json::to_vec(&marker_payload).unwrap(),
+    )
+    .unwrap();
+
+    let filesystem_accessor = create_test_filesystem_accessor(&iceberg_table_config);
+    let mut recovery = IcebergTableManager::new(
+        mooncake_table_metadata.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+        filesystem_accessor,
+        iceberg_table_config.clone(),
+    )
+    .await
+    .unwrap();
+    let _ = recovery.load_snapshot_from_table().await.unwrap();
+
+    assert!(
+        live_manifest.exists(),
+        "live snapshot's private manifest must NOT be deleted just because a corrupt marker payload named it"
+    );
+    assert_eq!(
+        std::fs::read(&live_manifest).unwrap(),
+        live_manifest_bytes_before,
+        "live private manifest content must be untouched"
+    );
+    assert!(
+        orphan_marker_dir.exists(),
+        "marker dir with cross-snapshot manifest payload must be retained for operator review"
+    );
+}
+
+/// Sibling of [`test_boot_reconcile_fails_closed_when_in_use_witness_unreliable`],
+/// pinning the **`Ok(None)`** arm of `collect_in_use_puffin_paths`. The
+/// previous test triggers fail-closed via a corrupt manifest (`Err` path);
+/// this one triggers it by *deleting* a live snapshot's manifest so the read
+/// returns `Ok(None)`. On a private-root-bound table that absence is the
+/// commit↔first-record gap anomaly, equivalent to a corrupt manifest — the
+/// in-use witness must downgrade to unreliable, table-root hash-puffin
+/// markers must fail-closed, and the marker dir must be retained.
+#[tokio::test]
+async fn test_boot_reconcile_fails_closed_when_live_manifest_absent() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let private_index_root = format!(
+        "{}/_mooncake_private",
+        iceberg_temp_dir.path().to_str().unwrap()
+    );
+    let mut iceberg_table_config = get_iceberg_table_config(&iceberg_temp_dir);
+    iceberg_table_config.private_index_root = Some(private_index_root.clone());
+
+    let table_temp_dir = tempdir().unwrap();
+    let mooncake_table_metadata =
+        create_test_table_metadata(table_temp_dir.path().to_str().unwrap().to_string());
+    let cache_temp_dir = tempdir().unwrap();
+    let (mut table, mut notify_rx) = create_mooncake_table_and_notify(
+        mooncake_table_metadata.clone(),
+        iceberg_table_config.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+    )
+    .await;
+    for (lsn, row) in [(1, test_row_1()), (2, test_row_2())] {
+        table.append(row).unwrap();
+        table.commit(lsn);
+        flush_table_and_sync(&mut table, &mut notify_rx, lsn)
+            .await
+            .unwrap();
+        assert!(table.try_create_mooncake_snapshot(SnapshotOption {
+            uuid: uuid::Uuid::new_v4(),
+            force_create: true,
+            dump_snapshot: false,
+            iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+            index_merge_option: MaintenanceOption::Skip,
+            data_compaction_option: MaintenanceOption::Skip,
+        }));
+        let (_, persistence_snapshot_payload, _, _, _) =
+            sync_mooncake_snapshot(&mut table, &mut notify_rx).await;
+        let persistence_snapshot_result =
+            create_iceberg_snapshot(&mut table, persistence_snapshot_payload, &mut notify_rx)
+                .await
+                .unwrap();
+        table.set_persistence_snapshot_res(persistence_snapshot_result);
+    }
+    drop(table);
+
+    let table_root = std::fs::read_dir(&private_index_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .unwrap()
+        .path();
+
+    // Identify the current snapshot's manifest so we can leave it intact (the
+    // load path still needs to read it) and DELETE the OTHER live snapshot's
+    // manifest — `read_snap_manifest` will return Ok(None) for that one and
+    // must downgrade reliability.
+    let metadata_dir = iceberg_temp_dir
+        .path()
+        .join(ICEBERG_TEST_NAMESPACE)
+        .join(ICEBERG_TEST_TABLE)
+        .join("metadata");
+    let version = std::fs::read_to_string(metadata_dir.join("version-hint.text"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let metadata_json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(metadata_dir.join(format!("v{version}.metadata.json"))).unwrap(),
+    )
+    .unwrap();
+    let current_snapshot_id = metadata_json
+        .get("current-snapshot-id")
+        .and_then(|v| v.as_i64())
+        .unwrap();
+
+    let manifest_dir = table_root.join("manifest");
+    let manifest_paths: Vec<_> = std::fs::read_dir(&manifest_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(manifest_paths.len(), 2);
+    let older_manifest = manifest_paths
+        .iter()
+        .find(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix("snap-"))
+                .and_then(|s| s.parse::<i64>().ok())
+                != Some(current_snapshot_id)
+        })
+        .unwrap();
+    std::fs::remove_file(older_manifest).unwrap();
+
+    // Plant a hanging hash-puffin marker. With Ok(None) demoting reliability,
+    // the classifier returns Trusted(HashPuffin) but the fail-closed branch
+    // must skip it and retain the marker dir.
+    let warehouse_data_dir = iceberg_temp_dir
+        .path()
+        .join(ICEBERG_TEST_NAMESPACE)
+        .join(ICEBERG_TEST_TABLE)
+        .join("data");
+    std::fs::create_dir_all(&warehouse_data_dir).unwrap();
+    let synthetic_puffin =
+        warehouse_data_dir.join(format!("{}-hash-index-v1-puffin.bin", uuid::Uuid::new_v4()));
+    std::fs::write(&synthetic_puffin, b"pretend puffin").unwrap();
+
+    const ORPHAN_SNAPSHOT_ID: i64 = 99_993;
+    let orphan_marker_dir = table_root
+        .join(".markers")
+        .join(ORPHAN_SNAPSHOT_ID.to_string());
+    std::fs::create_dir_all(&orphan_marker_dir).unwrap();
+    let marker_payload = serde_json::json!({
+        "schema_version": "v1",
+        "snapshot_id": ORPHAN_SNAPSHOT_ID,
+        "file_path": synthetic_puffin.to_str().unwrap(),
+        "op": "create",
+    });
+    std::fs::write(
+        orphan_marker_dir.join(format!("{}.marker.create", uuid::Uuid::new_v4())),
+        serde_json::to_vec(&marker_payload).unwrap(),
+    )
+    .unwrap();
+
+    let filesystem_accessor = create_test_filesystem_accessor(&iceberg_table_config);
+    let mut recovery = IcebergTableManager::new(
+        mooncake_table_metadata.clone(),
+        create_test_object_storage_cache(&cache_temp_dir),
+        filesystem_accessor,
+        iceberg_table_config.clone(),
+    )
+    .await
+    .unwrap();
+    let _ = recovery.load_snapshot_from_table().await.unwrap();
+
+    assert!(
+        synthetic_puffin.exists(),
+        "fail-closed: hash-puffin must NOT be deleted when a live snapshot's manifest is absent (Ok(None)) — witness downgraded to unreliable"
+    );
+    assert!(
+        orphan_marker_dir.exists(),
+        "marker dir must be retained while witness is unreliable — retry next boot"
+    );
+}
+
+// NOTE: the peek-before-persist / drain-only-on-success invariant in
+// `iceberg_table_syncer::sync_snapshot_impl` (search "INVARIANT — peek
+// before persist") is not yet pinned by an executable test at this layer.
+// The session-level approach (deliberately corrupting the private root
+// mid-commit and checking the catalog state survives) trips mooncake's
+// "single-writer, fail-fatal" model: the iceberg table manager is not
+// returned to the table on a persist error, so the retry inside the same
+// session panics on `take().unwrap()` before the invariant can be observed.
 //
-// Direct-API testing (constructing PersistenceSnapshotPayload by hand and
-// driving IcebergTableManager::sync_snapshot directly) would work but costs
-// ~150 LOC of fixture setup for a single assertion. The proper home is the
-// chaos test infrastructure landing alongside the boot reconciliation
-// work, where "kill mid-commit + reopen" is first-class — tracked in
-// IMPLEMENTATION_PLAN.md §B-9 as the `persist_failure_preserves_catalog_blobs`
-// scenario. Until that lands, the invariant is held by the load-bearing
-// INVARIANT comment at the syncer call site in `iceberg_table_syncer.rs`
-// (search "INVARIANT — peek before persist") and by inspection-level review.
+// A smaller targeted test would extract the peek/persist/take/clear
+// sequence into a helper parameterised over a `PuffinWrite`-shaped trait,
+// then drive it with a fake catalog and a closure that simulates persist
+// failure. That refactor is genuinely worth doing and is tracked in
+// `AI_DOCs/iceberg_index_proposal/hash_index_refactor/code-review.md`
+// (Warm tier). Until then the invariant is held by:
+//   * the load-bearing INVARIANT comment at the syncer call site,
+//   * the snapshot-side reconciler reporting a missing current-snapshot
+//     private manifest if a persist failure leaves the table in that
+//     state on the next load, and
+//   * inspection-level review.
 
 #[tokio::test]
 async fn test_private_index_root_inside_table_root_rejected_on_write() {

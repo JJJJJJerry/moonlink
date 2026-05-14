@@ -262,14 +262,19 @@ impl FileIndexBlob {
 
     /// Deserialize from iceberg puffin blob.
     pub(crate) fn from_blob(blob: Blob) -> IcebergResult<Self> {
-        // Check blob type.
-        assert_eq!(
-            blob.blob_type(),
-            MOONCAKE_HASH_INDEX_V1,
-            "Expected hash index v1 blob type is {:?}, actual type is {:?}",
-            MOONCAKE_HASH_INDEX_V1,
-            blob.blob_type()
-        );
+        // A corrupted private manifest or hand-pointed blob could land here
+        // with the wrong blob type; rejecting via DataInvalid is preferable
+        // to panicking the recovery path.
+        if blob.blob_type() != MOONCAKE_HASH_INDEX_V1 {
+            return Err(IcebergError::new(
+                iceberg::ErrorKind::DataInvalid,
+                format!(
+                    "expected hash index v1 blob type {:?}, got {:?}",
+                    MOONCAKE_HASH_INDEX_V1,
+                    blob.blob_type()
+                ),
+            ));
+        }
 
         serde_json::from_slice(blob.data()).map_err(|e| {
             IcebergError::new(

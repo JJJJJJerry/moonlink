@@ -60,10 +60,11 @@ pub(crate) fn get_delta_table_config(temp_dir: &TempDir) -> DeltalakeTableConfig
 
 /// Test util function to get iceberg table config for local filesystem.
 ///
-/// Sets `private_index_root` to a sibling of the Iceberg table root by default so
-/// the hash-index Mode 2a write path (`PrivateManifestStore`) exercises and
-/// persists blob entries — without this, the persist path early-returns and any
-/// test that loads back the hash index sees an empty `file_indices` collection.
+/// Sets `private_index_root` to a sibling of the Iceberg table root by default
+/// so the hash-index write path (`PrivateManifestStore`) exercises and
+/// persists blob entries — without this, the persist path early-returns and
+/// any test that loads back the hash index sees an empty `file_indices`
+/// collection.
 /// Tests that need to assert legacy `private_index_root = None` behaviour, or to
 /// place the root inside the Iceberg table root for `validate_deployment`
 /// negative cases, override the field after constructing the config.
@@ -173,10 +174,10 @@ pub(crate) fn create_iceberg_table_config(warehouse_uri: String) -> IcebergTable
         }
     };
 
-    // Default `private_index_root` to a warehouse sibling so the Mode 2a hash-index
-    // write path is exercised in tests. See `get_iceberg_table_config` for the
-    // same rationale — without this, persist early-returns and recovery sees an
-    // empty file_indices collection.
+    // Default `private_index_root` to a warehouse sibling so the hash-index
+    // write path is exercised in tests. See `get_iceberg_table_config` for
+    // the same rationale — without this, persist early-returns and recovery
+    // sees an empty file_indices collection.
     let private_index_root = Some(format!(
         "{}/_mooncake_private",
         warehouse_uri.trim_end_matches('/')

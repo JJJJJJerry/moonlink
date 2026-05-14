@@ -839,8 +839,7 @@ impl IcebergTableManager {
         };
         self.iceberg_table = Some(updated_iceberg_table);
 
-        // Persist hash-index puffin pointers to the mooncake-private manifest
-        // (Mode 2a).
+        // Persist hash-index puffin pointers to the per-table private manifest.
         //
         // INVARIANT — peek before persist, drain only on success. If you refactor
         // this block, preserve the three-step shape:
@@ -859,8 +858,8 @@ impl IcebergTableManager {
         // Iceberg snapshot_id returned by `txn.commit`, so a crash between commit
         // return and the first marker write leaves a live Iceberg snapshot with
         // no marker dir and no private manifest. `scan_hanging` cannot detect
-        // this; reconciliation must probe live snapshots for a missing
-        // `snap-<id>.json`. See `09_b1_b2_private_manifest_walkthrough.md` §5 R1.
+        // this; the snapshot-side reconciler covers it by probing live snapshots
+        // for a missing `snap-<id>.json` at load time.
         self.persist_private_manifest(self.catalog.peek_file_index_blobs_to_add())
             .await?;
         let _ = self.catalog.take_file_index_blobs_to_add();
@@ -875,15 +874,22 @@ impl IcebergTableManager {
         })
     }
 
-    /// Persist hash-index puffin pointers to the mooncake-private manifest store.
+    /// Persist hash-index puffin pointers to the per-table private manifest store.
     ///
-    /// No-op when:
-    /// - `private_index_root` is unconfigured (legacy / non-Mode-2a tables), or
-    /// - no file-index blobs were produced and the previous manifest is still valid.
+    /// Always writes a manifest for the current Iceberg snapshot when a
+    /// private root is configured — even if this commit produced no new
+    /// hash-index blobs. The written manifest carries the inherited entries
+    /// from the parent (if any) plus whatever this commit added, so a later
+    /// table load can anchor `snap-<current>.json` to the live snapshot id
+    /// regardless of whether new hash data was emitted.
     ///
-    /// Uses `self.filesystem_accessor` for I/O, which implies the private root must
-    /// live on the same backend / credentials as the data root for now. Cross-bucket
-    /// private roots require a separate accessor and are deferred.
+    /// No-op only when `private_index_root` is unconfigured (the table has
+    /// not opted into private hash-index storage).
+    ///
+    /// Uses `self.filesystem_accessor` for I/O, which implies the private
+    /// root must live on the same backend / credentials as the data root
+    /// for now. Cross-bucket private roots require a separate accessor and
+    /// are deferred.
     async fn persist_private_manifest(
         &self,
         file_index_blobs: &HashMap<String, Vec<PuffinBlobMetadata>>,
@@ -913,13 +919,46 @@ impl IcebergTableManager {
 
         let mut entries: Vec<HashIndexEntry> = Vec::new();
         if let Some(parent_snapshot_id) = current_snapshot.parent_snapshot_id() {
-            if let Some(parent_manifest) = store.read_snap_manifest(parent_snapshot_id).await? {
-                entries.extend(
-                    parent_manifest
-                        .hash_index_entries
-                        .into_iter()
-                        .filter(|entry| live_puffin_files.contains(&entry.puffin_file_path)),
-                );
+            match store.read_snap_manifest(parent_snapshot_id).await? {
+                Some(parent_manifest) => {
+                    entries.extend(
+                        parent_manifest
+                            .hash_index_entries
+                            .into_iter()
+                            .filter(|entry| live_puffin_files.contains(&entry.puffin_file_path)),
+                    );
+                }
+                // The parent snapshot exists in the Iceberg snapshot chain
+                // but its private manifest is missing. Continuing would
+                // persist a complete-looking manifest for the current
+                // snapshot that is actually truncated — the inherited
+                // hash-index entries would be lost forever, and the next
+                // table load would not flag the anomaly (the current
+                // snapshot's manifest reads fine, so the snapshot-side
+                // reconciler stays silent). Fail-closed: surface the
+                // problem now and let the snapshot-side reconciler pick it
+                // up on the next load (it sees the current snapshot has no
+                // private manifest because we never wrote one).
+                //
+                // TODO: once a rebuild path exists (reconstruct entries
+                // from the parent's actual puffin set via Iceberg
+                // metadata), call it here instead of failing the write.
+                // Until then a missing parent manifest on a
+                // private-root-bound table indicates either a corrupt
+                // private root or an unsupported "legacy → private root"
+                // migration that needs operator intervention.
+                None => {
+                    return Err(IcebergError::new(
+                        iceberg::ErrorKind::DataInvalid,
+                        format!(
+                            "private manifest write for snapshot {snapshot_id}: parent \
+                             snapshot {parent_snapshot_id} has no private manifest, refusing \
+                             to persist a truncated manifest for the current snapshot \
+                             (table_uuid {table_uuid})"
+                        ),
+                    )
+                    .into());
+                }
             }
         }
 

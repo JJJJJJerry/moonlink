@@ -1,20 +1,19 @@
-//! Mode 2a private manifest store for mooncake's correctness-critical hash index.
+//! Per-table private manifest store for mooncake's hash-index metadata.
 //!
-//! Phase B (B-2): hash-index puffin blobs no longer travel through the Iceberg
-//! `manifest_list` chain (see B-1). Instead, one JSON manifest per Iceberg snapshot is
-//! written to a mooncake-private root that lives **outside** the Iceberg table root:
+//! Hash-index puffin blobs do not travel through the Iceberg `manifest_list`
+//! chain (cross-engine readers such as Spark / pyiceberg / Trino reject the
+//! mooncake-specific Data+Puffin entry shape). Instead, one JSON manifest per
+//! Iceberg snapshot is written to a per-table private root:
 //!
 //! ```text
 //! <private_root>/<table_uuid>/manifest/snap-<iceberg_snapshot_id>.json
 //! ```
 //!
-//! Cross-engine readers (Spark, pyiceberg, Trino) never see this directory; mooncake
-//! reads it on bgworker boot to rebuild `MooncakeIndex`. Retention is tied to the
-//! Iceberg snapshot history (a sweeper, B-5, will drop manifests for expired snapshots).
-//!
-//! See `AI_DOCs/iceberg_index_proposal/hash_index_refactor/IMPLEMENTATION_PLAN.md` §1.2
-//! for the on-disk layout and §三选一 Invariant — this artifact satisfies option 3 (can
-//! be rebuilt from data files + cost-gating fallback at query time).
+//! The private root is keyed by Iceberg table UUID and is read at table load
+//! to rebuild `MooncakeIndex`. Retention is tied to the Iceberg snapshot
+//! history; a future sweeper will drop manifests for expired snapshots. The
+//! hash index is rebuildable from data files, so a missing manifest degrades
+//! to a cost-gated rebuild rather than data loss.
 
 use crate::storage::filesystem::accessor::base_filesystem_accessor::BaseFileSystemAccess;
 use crate::{Error, Result};
@@ -73,8 +72,9 @@ impl PrivateManifest {
 
 /// Reads/writes mooncake-private snapshot manifests.
 ///
-/// One instance per mirrored table. `root` is the **private** root (must be outside
-/// the Iceberg table root — enforced by B-3 boot validation, not here).
+/// One instance per mirrored table. `root` is the private root; deployment
+/// validation enforces its relationship to the Iceberg table root separately
+/// (see [`validate_deployment`] below).
 #[derive(Debug)]
 pub(crate) struct PrivateManifestStore {
     fs: Arc<dyn BaseFileSystemAccess>,
@@ -101,17 +101,27 @@ impl PrivateManifestStore {
         format!("{}/snap-{}.json", self.manifest_dir(), iceberg_snapshot_id)
     }
 
-    /// Public accessor used by the marker pre-write hook (B-5c) to record the
-    /// planned manifest write before it happens. Mirrors `manifest_path` so
-    /// markers and the actual writer never disagree on the target URI.
+    /// Public accessor used by the marker pre-write hook to record the planned
+    /// manifest write before it happens. Mirrors `manifest_path` so markers
+    /// and the actual writer never disagree on the target URI.
     pub(crate) fn manifest_path_for(&self, iceberg_snapshot_id: i64) -> String {
         self.manifest_path(iceberg_snapshot_id)
     }
 
-    /// Persist a manifest for the given Iceberg snapshot. Overwrites any prior file
-    /// at the same path — callers are expected to invoke this once per successful
-    /// Iceberg snapshot commit, so collisions imply a retry of the same commit_lsn.
+    /// Persist a manifest for the given Iceberg snapshot. Overwrites any
+    /// prior file at the same path — callers are expected to invoke this
+    /// once per successful Iceberg snapshot commit, so collisions imply a
+    /// retry of the same commit.
     pub(crate) async fn write_snap_manifest(&self, manifest: &PrivateManifest) -> Result<()> {
+        if manifest.table_uuid != self.table_uuid {
+            return Err(Error::IcebergError(ErrorStruct::new(
+                format!(
+                    "refusing to write private manifest with table_uuid {}: store is bound to {}",
+                    manifest.table_uuid, self.table_uuid
+                ),
+                ErrorStatus::Permanent,
+            )));
+        }
         let path = self.manifest_path(manifest.iceberg_snapshot_id);
         let body = serde_json::to_vec_pretty(manifest)?;
         self.fs.write_object(&path, body).await?;
@@ -148,12 +158,24 @@ impl PrivateManifestStore {
                 ErrorStatus::Permanent,
             )));
         }
+        // Self-check the embedded snapshot id against the one the filename
+        // anchors on. A renamed / copied / hand-edited file could otherwise
+        // be silently loaded as the wrong snapshot's index.
+        if manifest.iceberg_snapshot_id != iceberg_snapshot_id {
+            return Err(Error::IcebergError(ErrorStruct::new(
+                format!(
+                    "Mooncake private manifest snapshot id mismatch at {path}: expected {iceberg_snapshot_id}, payload reports {}",
+                    manifest.iceberg_snapshot_id
+                ),
+                ErrorStatus::Permanent,
+            )));
+        }
         Ok(Some(manifest))
     }
 
-    /// List Iceberg snapshot ids that have a persisted manifest, in unspecified order.
-    /// Caller is responsible for cross-checking against the live Iceberg snapshot set
-    /// (B-5 sweeper / boot rebuild).
+    /// List Iceberg snapshot ids that have a persisted manifest, in
+    /// unspecified order. The caller cross-checks against the live Iceberg
+    /// snapshot set (e.g. load-time reconciliation, retention sweeper).
     pub(crate) async fn list_snapshot_ids(&self) -> Result<Vec<i64>> {
         // Manifest entries are `snap-<id>.json` *files*. `list_direct_files` treats a
         // missing prefix as "no manifests yet" so the empty-store case lands here as
@@ -188,58 +210,71 @@ fn parse_snap_filename(name: &str) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// B-3 deployment validation
+// Per-table private root deployment validation
 //
-// Production Gate (ROADMAP §Production Gate / FINAL_SOLUTION §5.4): a mooncake
-// table can be in one of three deployment shapes:
-//   (a) `private_index_root` lives outside the Iceberg table root — recommended.
-//   (b) Inside the Iceberg table root but storage-level guards (IAM Deny / lifecycle
-//       exclusion) shield mooncake artifacts. Customer attests via signoff property.
-//   (c) Inside, no guards, no signoff — controlled beta only; rejected here.
+// A mooncake mirror table can deploy the private root in one of three shapes:
+//   - external-root:        `private_index_root` lives outside the Iceberg
+//                           table root. Recommended; Iceberg cleanup tools
+//                           (e.g. `RemoveOrphanFiles`) cannot reach mooncake
+//                           artifacts.
+//   - nested-with-ack:      private root sits inside the Iceberg table root,
+//                           but the operator has configured storage-level
+//                           guards (IAM Deny rules, lifecycle exclusions) and
+//                           attests via an acknowledgement property on the
+//                           Iceberg table.
+//   - nested-without-ack:   private root inside the Iceberg table root with
+//                           no acknowledgement. Rejected — Iceberg cleanup
+//                           can delete mooncake artifacts.
 //
-// This module only enforces what mooncake can *see*: prefix relationship between
-// the two URIs and presence of `mooncake.controlled_beta_signoff`. IAM/lifecycle
-// audit is an onboarding-checklist concern, not a runtime check.
+// This module only enforces what mooncake can see at runtime: the prefix
+// relationship between the two URIs and the presence of the acknowledgement
+// property. Auditing the IAM / lifecycle configuration itself is an operator
+// responsibility.
 // ---------------------------------------------------------------------------
 
-/// Iceberg property key carrying a customer's controlled-beta signoff token.
-/// Presence flips Path (b)/(c) from rejected to allowed-with-warning.
-pub(crate) const MOONCAKE_CONTROLLED_BETA_SIGNOFF: &str = "mooncake.controlled_beta_signoff";
+/// Iceberg property key carrying the operator's acknowledgement that the
+/// nested private root deployment is intentional and protected by
+/// storage-level guards. Presence flips a nested deployment from rejected
+/// to allowed-with-warning.
+pub(crate) const MOONCAKE_NESTED_PRIVATE_ROOT_ACK: &str = "mooncake.nested_private_root_ack";
 
-/// Outcome of `validate_deployment`. Callers (bgworker boot) translate to
-/// ereport severity: `Compliant` → OK, `SignedOff` → WARN, `Err` → ERROR.
+/// Outcome of `validate_deployment`. The bgworker that loads the table maps
+/// `Compliant` to OK, `NestedWithAck` to WARN, and `Err` to ERROR.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DeploymentStatus {
-    /// Path (a): private root outside Iceberg table root.
+    /// External-root deployment: private root outside the Iceberg table root.
     Compliant,
-    /// Path (b): inside, but customer attested via signoff.
-    SignedOff { signoff_id: String },
+    /// Nested deployment: private root inside the Iceberg table root, with
+    /// an explicit operator acknowledgement attached as a table property.
+    NestedWithAck { ack_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum DeploymentValidationError {
     #[error(
         "mooncake.private_index_root ({private_root:?}) is under the Iceberg table root \
-         ({iceberg_root:?}) without a controlled-beta signoff — Path (c) is rejected. \
-         See docs/onboarding/production_gate.md."
+         ({iceberg_root:?}); configure mooncake.nested_private_root_ack to attest that \
+         storage-level rules protect mooncake artifacts, or move private_index_root \
+         outside the table root."
     )]
-    InsidePathWithoutSignoff {
+    NestedWithoutAck {
         private_root: String,
         iceberg_root: String,
     },
 }
 
-/// Validate that a mooncake mirror table's deployment satisfies Production Gate
-/// requirements. Returns `Ok(Compliant)` for Path (a), `Ok(SignedOff)` for Path (b),
-/// and an error for Path (c).
+/// Validate the relationship between the Iceberg table root and the mooncake
+/// private root. Returns `Compliant` for an external-root deployment,
+/// `NestedWithAck` for a nested deployment with an acknowledgement, and an
+/// error for a nested deployment without one.
 ///
-/// Strips trailing slashes before comparison; URI scheme is treated as part of the
-/// path string (no canonicalization across schemes — different schemes are by
-/// definition disjoint roots).
+/// Strips trailing slashes before comparison; URI scheme is treated as part
+/// of the path string (no canonicalization across schemes — different schemes
+/// are by definition disjoint roots).
 pub(crate) fn validate_deployment(
     iceberg_table_root: &str,
     private_index_root: &str,
-    controlled_beta_signoff: Option<&str>,
+    nested_private_root_ack: Option<&str>,
 ) -> std::result::Result<DeploymentStatus, DeploymentValidationError> {
     let iceberg = normalize_deployment_root(iceberg_table_root);
     let private = normalize_deployment_root(private_index_root);
@@ -254,14 +289,14 @@ pub(crate) fn validate_deployment(
     if !is_under {
         return Ok(DeploymentStatus::Compliant);
     }
-    if let Some(signoff) = controlled_beta_signoff {
-        if !signoff.trim().is_empty() {
-            return Ok(DeploymentStatus::SignedOff {
-                signoff_id: signoff.to_string(),
+    if let Some(ack) = nested_private_root_ack {
+        if !ack.trim().is_empty() {
+            return Ok(DeploymentStatus::NestedWithAck {
+                ack_id: ack.to_string(),
             });
         }
     }
-    Err(DeploymentValidationError::InsidePathWithoutSignoff {
+    Err(DeploymentValidationError::NestedWithoutAck {
         private_root: private,
         iceberg_root: iceberg,
     })
@@ -303,17 +338,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_path_c_rejected_when_under_iceberg_root() {
+    fn validate_nested_without_ack_rejected() {
         let err =
             validate_deployment("s3://wh/db/tbl", "s3://wh/db/tbl/_mooncake/", None).unwrap_err();
         assert!(matches!(
             err,
-            DeploymentValidationError::InsidePathWithoutSignoff { .. }
+            DeploymentValidationError::NestedWithoutAck { .. }
         ));
     }
 
     #[test]
-    fn validate_path_b_allowed_with_signoff() {
+    fn validate_nested_with_ack_allowed() {
         let status = validate_deployment(
             "s3://wh/db/tbl",
             "s3://wh/db/tbl/_mooncake/",
@@ -322,26 +357,26 @@ mod tests {
         .unwrap();
         assert_eq!(
             status,
-            DeploymentStatus::SignedOff {
-                signoff_id: "docusign-1234".to_string()
+            DeploymentStatus::NestedWithAck {
+                ack_id: "docusign-1234".to_string()
             }
         );
     }
 
     #[test]
-    fn validate_empty_signoff_treated_as_absent() {
+    fn validate_empty_ack_treated_as_absent() {
         let err = validate_deployment("s3://wh/db/tbl/", "s3://wh/db/tbl/_mooncake/", Some("   "))
             .unwrap_err();
         assert!(matches!(
             err,
-            DeploymentValidationError::InsidePathWithoutSignoff { .. }
+            DeploymentValidationError::NestedWithoutAck { .. }
         ));
     }
 
     #[test]
     fn validate_sibling_prefix_is_not_under() {
         // `s3://wh/db/tbl_index/` shares the `s3://wh/db/tbl` byte prefix but is a
-        // sibling, not a child — must be accepted as Path (a).
+        // sibling, not a child — must be accepted as an external-root deployment.
         let status = validate_deployment("s3://wh/db/tbl", "s3://wh/db/tbl_index/", None).unwrap();
         assert_eq!(status, DeploymentStatus::Compliant);
     }
@@ -352,7 +387,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            DeploymentValidationError::InsidePathWithoutSignoff { .. }
+            DeploymentValidationError::NestedWithoutAck { .. }
         ));
     }
 
@@ -407,5 +442,54 @@ mod tests {
         let back: PrivateManifest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(m, back);
         assert_eq!(back.schema_version, PRIVATE_MANIFEST_FORMAT_V1);
+    }
+
+    /// Defense in depth: a `snap-100.json` file whose payload claims a
+    /// different snapshot id must not be silently loaded as snapshot 100.
+    /// A corrupted private root, a hand-edited file, or a misnamed copy
+    /// would otherwise cross-load one snapshot's index into another.
+    #[tokio::test]
+    async fn read_snap_manifest_rejects_snapshot_id_mismatch() {
+        use crate::storage::filesystem::accessor::filesystem_accessor::FileSystemAccessor;
+        let temp = tempfile::tempdir().unwrap();
+        let fs = FileSystemAccessor::default_for_test(&temp);
+        let uuid = Uuid::new_v4();
+        let store = PrivateManifestStore::new(fs, temp.path().to_str().unwrap().to_string(), uuid);
+
+        // Write a manifest claiming snapshot id 99 but plant it under the
+        // path the store expects for snapshot id 100.
+        let bogus = PrivateManifest::new(99, uuid, Vec::new());
+        let bogus_path = store.manifest_path_for(100);
+        store
+            .fs
+            .write_object(&bogus_path, serde_json::to_vec_pretty(&bogus).unwrap())
+            .await
+            .unwrap();
+
+        let err = store.read_snap_manifest(100).await.unwrap_err();
+        assert!(
+            matches!(err, Error::IcebergError(ref es) if es.status == ErrorStatus::Permanent),
+            "expected permanent error on snapshot_id mismatch, got {err:?}",
+        );
+    }
+
+    /// Symmetric write-side check: a store bound to one table UUID must
+    /// refuse to write a manifest claiming a different table UUID.
+    #[tokio::test]
+    async fn write_snap_manifest_rejects_table_uuid_mismatch() {
+        use crate::storage::filesystem::accessor::filesystem_accessor::FileSystemAccessor;
+        let temp = tempfile::tempdir().unwrap();
+        let fs = FileSystemAccessor::default_for_test(&temp);
+        let bound_uuid = Uuid::new_v4();
+        let other_uuid = Uuid::new_v4();
+        let store =
+            PrivateManifestStore::new(fs, temp.path().to_str().unwrap().to_string(), bound_uuid);
+
+        let foreign = PrivateManifest::new(1, other_uuid, Vec::new());
+        let err = store.write_snap_manifest(&foreign).await.unwrap_err();
+        assert!(
+            matches!(err, Error::IcebergError(ref es) if es.status == ErrorStatus::Permanent),
+            "expected permanent error on table_uuid mismatch, got {err:?}",
+        );
     }
 }
