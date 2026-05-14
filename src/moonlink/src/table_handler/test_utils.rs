@@ -45,6 +45,7 @@ pub fn create_row(id: i32, name: &str, age: i32) -> MoonlinkRow {
 
 /// Get iceberg table manager config.
 pub fn get_iceberg_manager_config(table_name: String, warehouse_uri: String) -> IcebergTableConfig {
+    let private_index_root = Some(format!("{warehouse_uri}/_mooncake_private"));
     let storage_config = StorageConfig::FileSystem {
         root_directory: warehouse_uri,
         atomic_write_dir: None,
@@ -56,7 +57,12 @@ pub fn get_iceberg_manager_config(table_name: String, warehouse_uri: String) -> 
         metadata_accessor_config: IcebergCatalogConfig::File {
             accessor_config: AccessorConfig::new_with_storage_config(storage_config),
         },
-        private_index_root: None,
+        // Default the per-table private root under the warehouse so recovery
+        // tests can rehydrate hash indices via the private manifest. Mirrors
+        // `storage::mooncake_table::table_creation_test_utils::get_iceberg_table_config`,
+        // which acquired the same default earlier; this parallel helper was
+        // missed at the time.
+        private_index_root,
     }
 }
 
