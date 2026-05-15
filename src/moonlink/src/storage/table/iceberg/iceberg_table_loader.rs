@@ -5,6 +5,7 @@ use crate::storage::mooncake_table::DiskFileEntry;
 use crate::storage::mooncake_table::Snapshot as MooncakeSnapshot;
 use crate::storage::storage_utils::{create_data_file, FileId, TableId, TableUniqueFileId};
 use crate::storage::table::iceberg::deletion_vector::DeletionVector;
+use crate::storage::table::iceberg::hash_index_summary;
 use crate::storage::table::iceberg::iceberg_table_manager::*;
 use crate::storage::table::iceberg::index::FileIndexBlob;
 use crate::storage::table::iceberg::puffin_utils::PuffinBlobRef;
@@ -35,6 +36,47 @@ impl IcebergTableManager {
                 &self.mooncake_table_metadata,
             );
         }
+    }
+
+    /// Load every file index referenced by the current snapshot's
+    /// `HashIndexSnapshotState`. The state is the **complete** live set,
+    /// so this fully rebuilds `persisted_hash_index_state` — no merging
+    /// with any prior in-memory view is required.
+    async fn load_hash_index_from_summary(
+        &mut self,
+        file_io: &iceberg::io::FileIO,
+        next_file_id: &mut u64,
+        loaded_file_indices: &mut Vec<MooncakeFileIndex>,
+    ) -> IcebergResult<()> {
+        let table_metadata = self.iceberg_table.as_ref().unwrap().metadata();
+        let Some(state) = hash_index_summary::read_state_from_snapshot(table_metadata)? else {
+            return Ok(());
+        };
+
+        let blob_pairs = hash_index_summary::load_blobs_from_state(&state, file_io).await?;
+        let table_id = TableId(self.mooncake_table_metadata.table_id);
+        for (pointer, mut blob) in blob_pairs.into_iter() {
+            let mooncake_file_index = blob
+                .file_index
+                .as_mooncake_file_index(
+                    &self.remote_data_file_to_file_id,
+                    self.object_storage_cache.clone(),
+                    self.filesystem_accessor.as_ref(),
+                    table_id,
+                    next_file_id,
+                )
+                .await?;
+            // Mirror the legacy path's `persisted_file_indices` bookkeeping
+            // (uses puffin URI as the value) so legacy retention helpers can
+            // still inspect it; the authoritative live state, however, is
+            // `persisted_hash_index_state`.
+            self.persisted_file_indices
+                .insert(mooncake_file_index.clone(), pointer.puffin_uri.clone());
+            self.persisted_hash_index_state
+                .insert(mooncake_file_index.clone(), pointer);
+            loaded_file_indices.push(mooncake_file_index);
+        }
+        Ok(())
     }
 
     /// Load index file into table manager from the current manifest entry.
@@ -265,6 +307,13 @@ impl IcebergTableManager {
         let file_io = self.iceberg_table.as_ref().unwrap().file_io().clone();
         let mut loaded_file_indices = vec![];
 
+        // Private-storage hash-index pointers live in `snapshot.summary`,
+        // not in the manifest_list. Branch off here so the manifest scan
+        // only handles data files + deletion vectors. Deletion vectors are
+        // unaffected — they remain in the manifest_list (in-spec Iceberg).
+        let private_hash_index_active = self.config.hash_index_private_storage.is_some()
+            && hash_index_summary::read_state_from_snapshot(table_metadata)?.is_some();
+
         // On load, we do two passes on all entries.
         // Data files are loaded first, because we need to get <data file, file id> mapping, which is used for later deletion vector and file indices recovery.
         // Deletion vector puffin and file indices have no dependency, and could be loaded in parallel.
@@ -304,16 +353,21 @@ impl IcebergTableManager {
             }
 
             for entry in manifest_entries.iter() {
-                // Load file indices.
-                let recovered_file_index = self
-                    .load_file_index_from_manifest_entry(
-                        entry.as_ref(),
-                        &file_io,
-                        &mut next_file_id,
-                    )
-                    .await?;
-                if let Some(recovered_file_index) = recovered_file_index {
-                    loaded_file_indices.push(recovered_file_index);
+                // Load file indices — only when private hash-index storage
+                // is not in effect; otherwise the puffin lives outside the
+                // Iceberg table and the manifest_list carries no FileIndex
+                // entries.
+                if !private_hash_index_active {
+                    let recovered_file_index = self
+                        .load_file_index_from_manifest_entry(
+                            entry.as_ref(),
+                            &file_io,
+                            &mut next_file_id,
+                        )
+                        .await?;
+                    if let Some(recovered_file_index) = recovered_file_index {
+                        loaded_file_indices.push(recovered_file_index);
+                    }
                 }
 
                 // Load deletion vector puffin.
@@ -330,6 +384,18 @@ impl IcebergTableManager {
                         .is_none());
                 }
             }
+        }
+
+        // Pull hash-index file indices from the private root referenced by
+        // `snapshot.summary`. Same `FileIndexBlob → MooncakeFileIndex`
+        // conversion as the legacy path; only the discovery channel changed.
+        if private_hash_index_active {
+            self.load_hash_index_from_summary(
+                &file_io,
+                &mut next_file_id,
+                &mut loaded_file_indices,
+            )
+            .await?;
         }
 
         let mooncake_snapshot = self.transform_to_mooncake_snapshot(

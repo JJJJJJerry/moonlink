@@ -13,6 +13,7 @@ use crate::storage::table::common::table_manager::{
     PersistenceFileParams, PersistenceResult, TableManager,
 };
 use crate::storage::table::iceberg::catalog_utils;
+use crate::storage::table::iceberg::hash_index_summary::HashIndexPointer;
 use crate::storage::table::iceberg::moonlink_catalog::MoonlinkCatalog;
 use crate::storage::table::iceberg::utils;
 use crate::IcebergTableConfig;
@@ -76,6 +77,13 @@ pub struct IcebergTableManager {
 
     /// Iceberg persistence stats.
     pub(crate) persistence_stats: Arc<IcebergPersistenceStats>,
+
+    /// Committed live hash-index pointers under the private-storage scheme.
+    /// Populated by the loader from the current snapshot's summary; replaced
+    /// wholesale by the syncer **after** a successful Iceberg commit so a
+    /// failed commit leaves the in-memory view unchanged. Empty when the
+    /// table is not using private hash-index storage.
+    pub(crate) persisted_hash_index_state: HashMap<MooncakeFileIndex, HashIndexPointer>,
 }
 
 impl IcebergTableManager {
@@ -101,6 +109,7 @@ impl IcebergTableManager {
             persisted_file_indices: HashMap::new(),
             remote_data_file_to_file_id: HashMap::new(),
             persistence_stats: Arc::new(IcebergPersistenceStats::new(mooncake_table_id)),
+            persisted_hash_index_state: HashMap::new(),
         })
     }
 
@@ -130,6 +139,7 @@ impl IcebergTableManager {
             persisted_file_indices: HashMap::new(),
             remote_data_file_to_file_id: HashMap::new(),
             persistence_stats: Arc::new(IcebergPersistenceStats::new(mooncake_table_id)),
+            persisted_hash_index_state: HashMap::new(),
         })
     }
 
@@ -167,6 +177,12 @@ impl IcebergTableManager {
                 self.mooncake_table_metadata.schema.as_ref(),
             )
             .await?;
+            // Enforce the private-root separation invariant before any IO
+            // can plant hash-index puffins next to (or inside) the Iceberg
+            // table tree — see `PrivateHashIndexConfig::validate_against_iceberg_table_root`.
+            if let Some(cfg) = &self.config.hash_index_private_storage {
+                cfg.validate_against_iceberg_table_root(table.metadata().location())?;
+            }
             self.iceberg_table = Some(table);
         }
         Ok(())
@@ -265,6 +281,7 @@ impl TableManager for IcebergTableManager {
         self.persisted_data_files.clear();
         self.persisted_file_indices.clear();
         self.remote_data_file_to_file_id.clear();
+        self.persisted_hash_index_state.clear();
 
         Ok(())
     }

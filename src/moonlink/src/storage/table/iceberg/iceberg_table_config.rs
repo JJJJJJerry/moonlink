@@ -165,6 +165,13 @@ pub struct IcebergTableConfig {
     pub data_accessor_config: AccessorConfig,
     /// Catalog configuration (defaults to File).
     pub metadata_accessor_config: IcebergCatalogConfig,
+    /// When set, mooncake's hash index bypasses the Iceberg `manifest_list`
+    /// chain entirely: puffin files land outside the Iceberg table root and
+    /// the live pointer set is published in `snapshot.summary`. See
+    /// [`hash_index_summary`](crate::storage::table::iceberg::hash_index_summary).
+    #[serde(default)]
+    pub hash_index_private_storage:
+        Option<crate::storage::table::iceberg::hash_index_summary::PrivateHashIndexConfig>,
 }
 
 impl IcebergTableConfig {
@@ -187,6 +194,7 @@ impl Default for IcebergTableConfig {
             metadata_accessor_config: IcebergCatalogConfig::File {
                 accessor_config: AccessorConfig::new_with_storage_config(storage_config),
             },
+            hash_index_private_storage: None,
         }
     }
 }

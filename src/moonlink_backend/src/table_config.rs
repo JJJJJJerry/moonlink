@@ -212,6 +212,7 @@ impl TableConfig {
                 table_name: mooncake_table_id.table.clone(),
                 data_accessor_config: self.iceberg_config.clone().unwrap(),
                 metadata_accessor_config,
+                hash_index_private_storage: None,
             },
             wal_table_config: WalConfig::new(
                 self.wal_config.unwrap(),

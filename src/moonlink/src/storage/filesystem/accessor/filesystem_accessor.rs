@@ -208,6 +208,35 @@ impl BaseFileSystemAccess for FileSystemAccessor {
         Ok(dirs)
     }
 
+    async fn list_direct_files(&self, folder: &str) -> Result<Vec<String>> {
+        let sanitized_folder = self.sanitize_path(folder);
+        let prefix = format!("{sanitized_folder}/");
+        let op = self.get_operator().await?;
+
+        // DM(Jerry): an opendal list on a missing prefix returns Ok([]) for fs / s3,
+        // so we don't need a pre-existence check. Verified for FsBackend + S3 in
+        // opendal 0.50; revisit if a new backend reports NotFound here.
+        let entries = match op.list(&prefix).await {
+            Ok(entries) => entries,
+            Err(e) if matches!(e.kind(), opendal::ErrorKind::NotFound) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut files = Vec::new();
+        for cur_entry in entries.iter() {
+            // Subdirectory entries end with '/'; skip them.
+            if cur_entry.path().ends_with('/') {
+                continue;
+            }
+            // Self-entry (the prefix itself, no trailing name) — skip.
+            if cur_entry.path() == sanitized_folder || cur_entry.path() == prefix {
+                continue;
+            }
+            files.push(cur_entry.path().to_string());
+        }
+        Ok(files)
+    }
+
     // TODO(hjiang): Remove this test function once fake-gcs fix the sending empty body will be error issue.
     #[cfg(all(feature = "storage-gcs", test))]
     async fn remove_directory(&self, directory: &str) -> Result<()> {

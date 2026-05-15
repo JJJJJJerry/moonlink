@@ -20,6 +20,9 @@ use crate::storage::table::iceberg::deletion_vector::{
     DELETION_VECTOR_CARDINALITY, DELETION_VECTOR_REFERENCED_DATA_FILE,
     MOONCAKE_DELETION_VECTOR_NUM_ROWS,
 };
+use crate::storage::table::iceberg::hash_index_summary::{
+    self, HashIndexPointer, HashIndexSnapshotState,
+};
 use crate::storage::table::iceberg::iceberg_table_manager::*;
 use crate::storage::table::iceberg::index::FileIndexBlob;
 use crate::storage::table::iceberg::io_utils as iceberg_io_utils;
@@ -678,6 +681,84 @@ impl IcebergTableManager {
         Ok(local_index_file_to_remote)
     }
 
+    /// Private-storage hash-index publication.
+    ///
+    /// Writes new file-index puffins under the private root, computes the
+    /// **complete** live state for the next Iceberg snapshot (= committed
+    /// state + new imports - removals), and returns it. Caller commits the
+    /// snapshot and only then replaces [`IcebergTableManager::persisted_hash_index_state`]
+    /// with the staged value — failure before commit leaves the in-memory
+    /// view untouched.
+    ///
+    /// Unlike the legacy [`Self::sync_file_indices`] path, this method
+    /// bypasses `catalog.record_puffin_metadata`, so the resulting puffin
+    /// files never appear in the Iceberg `manifest_list` — that bypass is
+    /// what gives external Iceberg readers a clean view.
+    async fn publish_hash_index_to_summary(
+        &self,
+        file_indices_to_import: &[MooncakeFileIndex],
+        file_indices_to_remove: &[MooncakeFileIndex],
+        local_data_file_to_remote: &HashMap<String, String>,
+    ) -> Result<(Vec<MooncakeFileIndex>, HashMap<MooncakeFileIndex, HashIndexPointer>)> {
+        let cfg = self
+            .config
+            .hash_index_private_storage
+            .as_ref()
+            .expect("publish_hash_index_to_summary invoked without private-storage config");
+        let table = self.iceberg_table.as_ref().unwrap();
+        let table_uuid = table.metadata().uuid();
+        let file_io = table.file_io().clone();
+        let fs = self.filesystem_accessor.clone();
+
+        let _guard = self.persistence_stats.sync_file_indices.start();
+
+        // Stage the next snapshot's state on top of the currently committed
+        // one. Removals apply first so a remove+re-import sequence on the
+        // same key behaves like a rewrite.
+        // DM(Jerry): MooncakeFileIndex carries interior-mutable cache
+        // handles, which clippy flags as a fragile hash-map key. Legacy
+        // `persisted_file_indices` keys the same type — the lint is accepted
+        // by the codebase at large, suppressed here to keep this site clean.
+        #[allow(clippy::mutable_key_type)]
+        let mut staged = self.persisted_hash_index_state.clone();
+        for fi in file_indices_to_remove {
+            if staged.remove(fi).is_none() {
+                // Mismatch usually means the caller's path normalization
+                // differs from how the entry was keyed at load time. Don't
+                // panic — log and move on so the snapshot still commits.
+                tracing::warn!(
+                    target: "moonlink::hash_index_summary::publish",
+                    "removal target missing from live state (path-normalization mismatch?)",
+                );
+            }
+        }
+
+        let mut remote_file_indices = Vec::with_capacity(file_indices_to_import.len());
+        for fi in file_indices_to_import {
+            let outcome = hash_index_summary::write_file_index_to_private_storage(
+                fi,
+                local_data_file_to_remote,
+                cfg,
+                table_uuid,
+                &file_io,
+                fs.as_ref(),
+            )
+            .await?;
+            // Key the staged map by the **remote-path** file index so it
+            // matches what the loader inserts when rehydrating from the
+            // snapshot summary on the next boot.
+            let remote_fi = Self::get_updated_file_index_at_import(
+                fi,
+                local_data_file_to_remote,
+                &outcome.local_index_file_to_private,
+            );
+            staged.insert(remote_fi.clone(), outcome.pointer);
+            remote_file_indices.push(remote_fi);
+        }
+
+        Ok((remote_file_indices, staged))
+    }
+
     /// Dump file indices into the iceberg table, only new file indices will be persisted into the table.
     /// Return file index ids which should be added into iceberg table.
     ///
@@ -785,19 +866,59 @@ impl IcebergTableManager {
             .sync_deletion_vector(new_deletion_vector, &file_params)
             .await?;
 
-        let remote_file_indices = self
-            .sync_file_indices(
-                &new_file_indices,
-                &old_file_indices,
-                data_file_import_result.local_data_files_to_remote,
-            )
-            .await?;
+        // Hash-index publication branches by config:
+        // - private storage enabled → publish via `snapshot.summary`, never
+        //   touch `manifest_list`; stage the next live state and commit it
+        //   to memory only on a successful Iceberg commit below.
+        // - private storage disabled (legacy) → embed hash-index puffins as
+        //   `Data+Puffin` manifest entries, as the original mooncake path did.
+        let (remote_file_indices, staged_hash_index_state) =
+            if self.config.hash_index_private_storage.is_some() {
+                self.publish_hash_index_to_summary(
+                    &new_file_indices,
+                    &old_file_indices,
+                    &data_file_import_result.local_data_files_to_remote,
+                )
+                .await
+                .map(|(remote, staged)| (remote, Some(staged)))
+                .map_err(|e| {
+                    IcebergError::new(
+                        iceberg::ErrorKind::Unexpected,
+                        format!("hash-index summary publish failed: {e}"),
+                    )
+                })?
+            } else {
+                let remote = self
+                    .sync_file_indices(
+                        &new_file_indices,
+                        &old_file_indices,
+                        data_file_import_result.local_data_files_to_remote,
+                    )
+                    .await?;
+                (remote, None)
+            };
 
-        // Update snapshot summary properties.
-        let snapshot_properties = HashMap::<String, String>::from([(
+        // Build snapshot.summary. Under private storage the hash-index key
+        // carries the **complete** live state for this snapshot — even when
+        // the current flush touched only data files or deletion vectors
+        // (otherwise hash indexes would silently disappear on next load).
+        let mut snapshot_properties = HashMap::<String, String>::from([(
             MOONCAKE_TABLE_FLUSH_LSN.to_string(),
             snapshot_payload.flush_lsn.to_string(),
         )]);
+        if let Some(staged) = staged_hash_index_state.as_ref() {
+            if !staged.is_empty() {
+                let state =
+                    HashIndexSnapshotState::new(staged.values().cloned().collect::<Vec<_>>());
+                snapshot_properties.insert(
+                    hash_index_summary::SNAPSHOT_SUMMARY_HASH_INDEX_KEY.to_string(),
+                    state.to_summary_value()?,
+                );
+            }
+            // Empty staged → omit the key. Loader treats absence as "no
+            // hash indexes for this snapshot", which is the correct outcome
+            // when every prior index has been removed.
+        }
 
         let mut txn = Transaction::new(self.iceberg_table.as_ref().unwrap());
         let mut action = txn.fast_append();
@@ -831,6 +952,15 @@ impl IcebergTableManager {
             txn.commit(&*self.catalog).await?
         };
         self.iceberg_table = Some(updated_iceberg_table);
+
+        // Commit the in-memory hash-index view only after Iceberg commit
+        // succeeds — `staged_hash_index_state` is otherwise dropped here,
+        // leaving `self.persisted_hash_index_state` matching the last good
+        // snapshot. The corollary: failure paths above must not have
+        // mutated `self.persisted_hash_index_state`.
+        if let Some(staged) = staged_hash_index_state {
+            self.persisted_hash_index_state = staged;
+        }
 
         self.catalog.clear_puffin_metadata();
 

@@ -56,6 +56,7 @@ pub fn get_iceberg_manager_config(table_name: String, warehouse_uri: String) -> 
         metadata_accessor_config: IcebergCatalogConfig::File {
             accessor_config: AccessorConfig::new_with_storage_config(storage_config),
         },
+        hash_index_private_storage: None,
     }
 }
 

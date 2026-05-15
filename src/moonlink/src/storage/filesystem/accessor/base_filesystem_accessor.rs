@@ -24,6 +24,12 @@ pub trait BaseFileSystemAccess: std::fmt::Debug + Send + Sync {
     /// For example, we have directory "a", "a/b", "a/b/c", listing direct subdirectories for "a" will return "a/b".
     async fn list_direct_subdirectories(&self, folder: &str) -> Result<Vec<String>>;
 
+    /// List direct file entries under the given directory, returning **absolute** paths.
+    ///
+    /// Excludes subdirectories. Returns an empty vec if the directory is absent
+    /// (treated as "no files yet" — sweeper-friendly).
+    async fn list_direct_files(&self, folder: &str) -> Result<Vec<String>>;
+
     /// Remove the whole directory recursively.
     async fn remove_directory(&self, directory: &str) -> Result<()>;
 

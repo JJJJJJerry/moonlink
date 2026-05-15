@@ -61,6 +61,7 @@ pub fn test_iceberg_table_config(context: &TestContext, table_name: &str) -> Ice
         metadata_accessor_config: crate::IcebergCatalogConfig::File {
             accessor_config: AccessorConfig::new_with_storage_config(storage_config),
         },
+        hash_index_private_storage: None,
     }
 }
 

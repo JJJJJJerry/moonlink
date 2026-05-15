@@ -57,6 +57,7 @@ pub(crate) fn get_rest_iceberg_table_config(tmp_dir: &TempDir) -> IcebergTableCo
         metadata_accessor_config: crate::IcebergCatalogConfig::Rest {
             rest_catalog_config: default_rest_catalog_config(),
         },
+        hash_index_private_storage: None,
     }
 }
 

@@ -21,6 +21,7 @@ pub(crate) mod parquet_stats_utils;
 pub(crate) mod parquet_utils;
 pub(crate) mod puffin_utils;
 pub(crate) mod puffin_writer_proxy;
+pub mod hash_index_summary;
 mod table_update_proxy;
 
 #[cfg(all(feature = "catalog-glue", feature = "storage-s3"))]
@@ -46,6 +47,9 @@ mod gcs_test_utils;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod hash_index_summary_test;
 
 #[cfg(test)]
 mod state_tests;
